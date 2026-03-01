@@ -1,0 +1,47 @@
+# Network configuration for the virtual telecom environment
+network:
+  # Virtual operator PLMN
+  mcc: "001"
+  mnc: "01"
+  operator_name: "Virtual Operator"
+
+  # RSP (Remote SIM Provisioning)
+  rsp:
+    # SM-DP+ server address
+    smdp_address: ""
+    # TLS verification
+    tls_verify: true
+    # Connection timeout (seconds)
+    timeout: 30
+
+  # APN configuration
+  apn:
+    default:
+      name: "internet"
+      protocol: "IPV4V6"
+      type: "default,supl"
+    ims:
+      name: "ims"
+      protocol: "IPV4V6"
+      type: "ims"
+
+  # DNS
+  dns:
+    servers:
+      - "8.8.8.8"
+      - "8.8.4.4"
+
+# Docker networking
+docker:
+  network_name: "telecom-net"
+  subnet: "172.28.0.0/24"
+  redroid_ip: "172.28.0.10"
+  vphone_ip: "172.28.0.20"
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+  file: "/var/log/vphone/vphone.log"
+  max_size_mb: 50
+  backup_count: 5

@@ -1,0 +1,38 @@
+# Virtual eUICC configuration
+euicc:
+  # EID (32 hex digits) - unique eUICC identifier
+  # Set via VPHONE_EUICC_EID environment variable or here
+  eid: "89001012012341234000000000000001"
+
+  # Specification version (SGP.22)
+  sgp22_version: "2.5.0"
+
+  # eUICC storage
+  profile_dir: "/var/lib/vphone/profiles"
+  key_dir: "/var/lib/vphone/keys"
+
+  # Resource limits
+  max_profiles: 8
+  total_nvram_kb: 512
+
+  # Platform capabilities
+  capabilities:
+    - contactless
+    - usim
+    - isim
+    - csim
+
+  # SCP03 key version for secure channel
+  scp03_key_version: 1
+
+# Test profile for development
+# Install via: POST /profiles/install
+test_profile:
+  iccid: "8901000000000000001"
+  imsi: "001010123456789"
+  ki: "000102030405060708090a0b0c0d0e0f"
+  opc: "000102030405060708090a0b0c0d0e0f"
+  mcc: "001"
+  mnc: "01"
+  spn: "Test Operator"
+  msisdn: "+10000000001"

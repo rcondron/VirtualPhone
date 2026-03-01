@@ -1,0 +1,71 @@
+version: "3.9"
+
+services:
+  # =========================================================================
+  # redroid - Android-in-Docker emulator
+  # =========================================================================
+  redroid:
+    image: redroid/redroid:13.0.0-latest
+    privileged: true
+    stdin_open: true
+    ports:
+      - "5555:5555"
+    volumes:
+      - redroid-data:/data
+      - ./hal/ril_bridge.py:/vendor/ril_bridge.py:ro
+    command:
+      - androidboot.redroid_gpu_mode=guest
+      - androidboot.redroid_net_ndns=1
+      - androidboot.hardware=ranchu
+      - ro.telephony.default_network=13
+      - persist.sys.timezone=UTC
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.10
+
+  # =========================================================================
+  # vphone - Virtual eUICC + Telecom Stack
+  # =========================================================================
+  vphone:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - vphone-profiles:/var/lib/vphone/profiles
+      - vphone-logs:/var/log/vphone
+    ports:
+      - "9000:9000"     # eUICC management API
+      - "8443:8443"     # RSP callback
+      - "5060:5060/udp" # SIP
+      - "5061:5061/tcp" # SIP-TLS
+    environment:
+      - VPHONE_EUICC_EID=${EUICC_EID:-89001012012341234000000000000001}
+      - VPHONE_RSP_SERVER=${RSP_SERVER:-}
+      - VPHONE_IMS_DOMAIN=${IMS_DOMAIN:-ims.mnc001.mcc001.3gppnetwork.org}
+      - VPHONE_IMS_PROXY=${IMS_PROXY:-}
+      - VPHONE_LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - REDROID_HOST=redroid
+      - REDROID_ADB_PORT=5555
+    depends_on:
+      - redroid
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.20
+    restart: unless-stopped
+
+networks:
+  telecom-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  redroid-data:
+  vphone-profiles:
+  vphone-logs:

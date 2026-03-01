@@ -1,0 +1,28 @@
+# Core
+pyyaml>=6.0
+pydantic>=2.0
+cryptography>=41.0
+pycryptodome>=3.19
+
+# APDU / smartcard
+pyscard>=2.0
+
+# ASN.1 encoding for RSP (SGP.22)
+asn1tools>=0.166
+pyasn1>=0.5
+
+# HTTP client (RSP ES9+ interface)
+httpx>=0.25
+aiohttp>=3.9
+
+# SIP / IMS
+aiosip>=0.3
+
+# Management API
+fastapi>=0.104
+uvicorn>=0.24
+
+# IPsec / IKEv2 (VoWiFi) - uses strongswan via subprocess
+# Testing
+pytest>=7.4
+pytest-asyncio>=0.23

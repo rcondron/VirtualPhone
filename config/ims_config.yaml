@@ -1,0 +1,66 @@
+# IMS (IP Multimedia Subsystem) configuration
+ims:
+  # IMS domain (derived from MCC/MNC if not set)
+  # Format: ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org
+  domain: ""
+
+  # P-CSCF (Proxy Call Session Control Function) address
+  # For VoWiFi, this is discovered from the ePDG tunnel
+  # For VoLTE, this comes from the PDN connection PCO
+  pcscf:
+    address: ""
+    port: 5060
+
+  # SIP transport
+  transport: "UDP"  # UDP, TCP, or TLS
+
+  # Registration
+  registration:
+    expiry: 3600      # seconds
+    retry_interval: 60
+    max_retries: 5
+
+  # Authentication
+  auth:
+    algorithm: "AKAv1-MD5"
+    # realm is derived from IMS domain
+
+  # IPsec (for VoLTE SIP security)
+  ipsec:
+    enabled: false
+    algorithm: "hmac-sha-1-96"
+    encryption: "null"  # or "aes-cbc"
+
+# VoWiFi configuration
+vowifi:
+  # ePDG (Evolved Packet Data Gateway) address
+  # Typically: epdg.epc.mnc<MNC>.mcc<MCC>.pub.3gppnetwork.org
+  epdg_address: ""
+
+  # APN for IMS over Wi-Fi
+  apn: "ims"
+
+  # IKEv2/IPsec parameters
+  ipsec:
+    ike_proposals: "aes256-sha256-modp2048"
+    esp_proposals: "aes256-sha256"
+    rekey_time: 3600
+    dpd_interval: 300
+
+  # EAP-AKA' parameters
+  eap:
+    method: "eap-aka"  # eap-aka or eap-aka-prime
+    network_name: ""   # For EAP-AKA' key derivation
+
+# VoLTE configuration
+volte:
+  # QoS parameters
+  qci: 1
+  gbr_ul: 41000   # bps
+  gbr_dl: 41000   # bps
+
+  # Codec priority
+  codecs:
+    - "AMR-WB"   # HD Voice
+    - "AMR-NB"   # Narrowband
+    - "EVS"      # Enhanced Voice Services
