@@ -82,32 +82,34 @@ class Milenage:
             result[i] = ((data[src1] << bit_shift) | (data[src2] >> (8 - bit_shift))) & 0xFF
         return bytes(result)
 
-    def f1(self, rand: bytes, sqn: bytes, amf: bytes) -> bytes:
-        """f1 - Network authentication function. Returns MAC-A (8 bytes)."""
+    def _f1_core(self, rand: bytes, sqn: bytes, amf: bytes) -> bytes:
+        """
+        Core of f1/f1* — compute OUT1 (16 bytes).
+
+        Per 3GPP TS 35.206 Annex 3 reference C code:
+        OUT1 = E_K(TEMP XOR rotate(IN1 XOR OPc, r1) XOR c1) XOR OPc
+        """
         # TEMP = E_K(RAND XOR OPc)
         temp = self._encrypt(self._xor(rand, self.opc))
 
         # IN1 = SQN || AMF || SQN || AMF
         in1 = sqn + amf + sqn + amf
 
-        # f1 = E_K(rotate(TEMP XOR OPc, r1) XOR c1) XOR OPc
-        rotated = self._rotate(self._xor(temp, self.opc), self._R[0])
-        xored_in1 = self._xor(rotated, in1)
-        xored_c1 = self._xor(xored_in1, self._C[0])
-        out = self._encrypt(xored_c1)
-        result = self._xor(out, self.opc)
-        return result[0:8]  # MAC-A
+        # rotate(IN1 XOR OPc, r1) — rotate the IN1/OPc mix, NOT temp/OPc
+        rotated = self._rotate(self._xor(in1, self.opc), self._R[0])
+
+        # XOR with TEMP and constant c1
+        enc_input = self._xor(self._xor(temp, rotated), self._C[0])
+        out = self._encrypt(enc_input)
+        return self._xor(out, self.opc)
+
+    def f1(self, rand: bytes, sqn: bytes, amf: bytes) -> bytes:
+        """f1 - Network authentication function. Returns MAC-A (8 bytes)."""
+        return self._f1_core(rand, sqn, amf)[0:8]
 
     def f1star(self, rand: bytes, sqn: bytes, amf: bytes) -> bytes:
         """f1* - Resynchronisation MAC function. Returns MAC-S (8 bytes)."""
-        temp = self._encrypt(self._xor(rand, self.opc))
-        in1 = sqn + amf + sqn + amf
-        rotated = self._rotate(self._xor(temp, self.opc), self._R[0])
-        xored_in1 = self._xor(rotated, in1)
-        xored_c1 = self._xor(xored_in1, self._C[0])
-        out = self._encrypt(xored_c1)
-        result = self._xor(out, self.opc)
-        return result[8:16]  # MAC-S
+        return self._f1_core(rand, sqn, amf)[8:16]
 
     def f2345(self, rand: bytes) -> tuple[bytes, bytes, bytes, bytes]:
         """

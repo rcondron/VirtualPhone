@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # =========================================================================
   # redroid - Android-in-Docker emulator
@@ -22,6 +20,8 @@ services:
     networks:
       telecom-net:
         ipv4_address: 172.28.0.10
+    profiles:
+      - android
 
   # =========================================================================
   # vphone - Virtual eUICC + Telecom Stack
@@ -39,7 +39,7 @@ services:
       - vphone-profiles:/var/lib/vphone/profiles
       - vphone-logs:/var/log/vphone
     ports:
-      - "19000:9000"    # eUICC management API
+      - "${VPHONE_API_PORT:-19000}:9000"  # eUICC management API
       - "8443:8443"     # RSP callback
       - "5060:5060/udp" # SIP
       - "5061:5061/tcp" # SIP-TLS
@@ -49,14 +49,19 @@ services:
       - VPHONE_IMS_DOMAIN=${IMS_DOMAIN:-ims.mnc001.mcc001.3gppnetwork.org}
       - VPHONE_IMS_PROXY=${IMS_PROXY:-}
       - VPHONE_LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - REDROID_HOST=redroid
+      - VPHONE_API_KEY=${VPHONE_API_KEY:-}
+      - REDROID_HOST=${REDROID_HOST:-}
       - REDROID_ADB_PORT=5555
-    depends_on:
-      - redroid
     networks:
       telecom-net:
         ipv4_address: 172.28.0.20
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
 
 networks:
   telecom-net:
