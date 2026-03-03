@@ -34,8 +34,9 @@ dev = [
 
 [project.scripts]
 vphone-euicc = "euicc.daemon:main"
-vphone-hal = "hal.service:main"
-vphone-api = "hal.management_api:app"
+vphone-hal = "hal.service:run"
+vphone-ims = "ims.service:run"
+vphone-rsp = "rsp.service:run"
 
 [tool.setuptools.packages.find]
 include = ["euicc*", "hal*", "ims*", "rsp*"]

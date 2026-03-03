@@ -110,8 +110,10 @@ async def main():
         await server.serve_forever()
 
 
-if __name__ == "__main__":
+def run():
+    """Synchronous entry point for the RSP service."""
     loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda: loop.stop())
     try:
@@ -120,3 +122,7 @@ if __name__ == "__main__":
         pass
     finally:
         loop.close()
+
+
+if __name__ == "__main__":
+    run()

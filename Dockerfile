@@ -2,7 +2,7 @@
 # Multi-stage build for a complete virtual telecom environment
 
 # =============================================================================
-# Stage 1: Build dependencies
+# Stage 1: Build dependencies and install package
 # =============================================================================
 FROM python:3.11-slim AS builder
 
@@ -12,8 +12,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --prefix=/install -r /tmp/requirements.txt
+WORKDIR /build
+
+# Copy project metadata first (better layer caching)
+COPY pyproject.toml .
+
+# Copy source packages
+COPY euicc/ euicc/
+COPY hal/ hal/
+COPY ims/ ims/
+COPY rsp/ rsp/
+
+# Install the package and all dependencies into /install prefix
+RUN pip install --no-cache-dir --prefix=/install .
 
 # =============================================================================
 # Stage 2: Runtime image
@@ -47,7 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     socat \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy Python packages from builder
+# Copy installed Python packages and entry point scripts from builder
 COPY --from=builder /install /usr/local
 
 # Create application user and directories
@@ -57,11 +68,7 @@ RUN useradd -r -s /bin/false -m vphone && \
 
 WORKDIR /opt/vphone
 
-# Copy application code
-COPY euicc/ euicc/
-COPY rsp/ rsp/
-COPY ims/ ims/
-COPY hal/ hal/
+# Copy non-Python assets (configs, scripts)
 COPY config/ config/
 COPY scripts/ scripts/
 
