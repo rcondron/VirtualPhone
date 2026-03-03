@@ -64,7 +64,9 @@ static char bridge_host[256] = "172.28.0.20";
 /* RIL unsolicited IDs */
 #define RIL_UNSOL_RADIO_STATE_CHANGED          1000
 #define RIL_UNSOL_NETWORK_STATE_CHANGED        1001
+#define RIL_UNSOL_CALL_RING                    1002
 #define RIL_UNSOL_NEW_SMS                      1003
+#define RIL_UNSOL_NITZ_TIME_RECEIVED           1008
 #define RIL_UNSOL_SIM_STATUS_CHANGED           1019
 
 /* RIL response types */
@@ -535,6 +537,140 @@ static char *request_data_enter_pin(parcel_t *req) {
     return json;
 }
 
+static char *request_data_dial(parcel_t *req) {
+    /* RIL_Dial: address (String16), clir (int32), uusInfo (ignored) */
+    char *address = parcel_read_str16(req);
+    int32_t clir  = parcel_read_i32(req);
+
+    char *json = (char *)malloc(JSON_BUF_SIZE);
+    snprintf(json, JSON_BUF_SIZE,
+        "{\"address\":\"%s\",\"clir\":%d}",
+        address ? address : "", clir);
+
+    free(address);
+    return json;
+}
+
+static char *request_data_hangup(parcel_t *req) {
+    /* RIL_Hangup: gsmIndex (int32) */
+    int32_t gsm_index = parcel_read_i32(req);
+
+    char *json = (char *)malloc(64);
+    snprintf(json, 64, "{\"gsmIndex\":%d}", gsm_index);
+    return json;
+}
+
+/* -------------------------------------------------------------------
+ * Additional response writers
+ * ------------------------------------------------------------------- */
+
+static void response_send_sms(parcel_t *resp, const char *data) {
+    /* RIL_SMS_Response: messageRef (int32), ackPdu (String16), errorCode (int32) */
+    parcel_write_i32(resp, json_get_int(data, "messageRef", 0));
+    char *ack_pdu = json_get_str(data, "ackPdu");
+    parcel_write_str16(resp, ack_pdu);
+    free(ack_pdu);
+    parcel_write_i32(resp, json_get_int(data, "errorCode", 0));
+}
+
+/*
+ * Parse a JSON array of call objects and write RIL_Call Parcels.
+ * The bridge returns: {"calls":[{state, index, isMT, isMpty, number, ...},...]}
+ *
+ * RIL getCurrentCalls response:
+ *   int32 num_calls
+ *   For each call:
+ *     int32 state, int32 index, int32 toa, int32 isMpty,
+ *     int32 isMT, int32 als, int32 isVoice, int32 isVoicePrivacy,
+ *     String16 number, int32 numberPresentation, String16 name,
+ *     int32 namePresentation, int32 hasUusInfo(0)
+ */
+static void response_current_calls(parcel_t *resp, const char *data) {
+    /* Quick count of calls by counting "index" keys */
+    int num_calls = 0;
+    const char *p = data;
+    while ((p = strstr(p, "\"index\"")) != NULL) {
+        num_calls++;
+        p += 7;
+    }
+    parcel_write_i32(resp, num_calls);
+
+    if (num_calls == 0) return;
+
+    /* Parse each call from the JSON array.
+     * Simple approach: find each "{" after "calls" and extract fields. */
+    const char *calls_start = strstr(data, "[");
+    if (!calls_start) return;
+
+    p = calls_start;
+    for (int i = 0; i < num_calls; i++) {
+        const char *obj = strchr(p + 1, '{');
+        if (!obj) break;
+
+        /* Find the end of this call object */
+        const char *obj_end = strchr(obj, '}');
+        if (!obj_end) break;
+
+        /* Extract fields from this call object using json_get_int/str */
+        /* We need to create a null-terminated substring */
+        size_t obj_len = obj_end - obj + 1;
+        char *call_json = (char *)malloc(obj_len + 1);
+        memcpy(call_json, obj, obj_len);
+        call_json[obj_len] = '\0';
+
+        parcel_write_i32(resp, json_get_int(call_json, "state", 0));
+        parcel_write_i32(resp, json_get_int(call_json, "index", i + 1));
+        parcel_write_i32(resp, 145);    /* TOA: international */
+        parcel_write_i32(resp, json_get_bool(call_json, "isMpty", 0));
+        parcel_write_i32(resp, json_get_bool(call_json, "isMT", 0));
+        parcel_write_i32(resp, 0);      /* als */
+        parcel_write_i32(resp, 1);      /* isVoice = true */
+        parcel_write_i32(resp, 0);      /* isVoicePrivacy */
+
+        char *number = json_get_str(call_json, "number");
+        parcel_write_str16(resp, number ? number : "");
+        free(number);
+
+        parcel_write_i32(resp, json_get_int(call_json, "numberPresentation", 0));
+
+        char *name = json_get_str(call_json, "name");
+        parcel_write_str16(resp, name ? name : "");
+        free(name);
+
+        parcel_write_i32(resp, 0);      /* namePresentation */
+        parcel_write_i32(resp, 0);      /* hasUusInfo = false */
+
+        free(call_json);
+        p = obj_end;
+    }
+}
+
+static void response_data_call_list(parcel_t *resp, const char *data) {
+    /* DataCallResponse: count of active data calls, each with:
+     *   status, suggestedRetryTime, cid, active, type, ifname, addresses,
+     *   dnses, gateways, pcscf, mtu
+     * Simplified: just return count=0 or count=1 with default values. */
+    int active = json_get_int(data, "active", 0);
+    if (active == 0 && !strstr(data, "\"cid\"")) {
+        parcel_write_i32(resp, 0); /* version */
+        parcel_write_i32(resp, 0); /* num calls */
+        return;
+    }
+    parcel_write_i32(resp, 11);    /* version */
+    parcel_write_i32(resp, 1);     /* num calls */
+    parcel_write_i32(resp, 0);     /* status: SUCCESS */
+    parcel_write_i32(resp, -1);    /* suggestedRetryTime */
+    parcel_write_i32(resp, json_get_int(data, "cid", 1));
+    parcel_write_i32(resp, json_get_int(data, "active", 2));
+    parcel_write_str16(resp, "IP");          /* type */
+    parcel_write_str16(resp, "rmnet0");      /* ifname */
+    parcel_write_str16(resp, "10.45.0.2");   /* addresses */
+    parcel_write_str16(resp, "172.28.0.50"); /* dnses */
+    parcel_write_str16(resp, "10.45.0.1");   /* gateways */
+    parcel_write_str16(resp, "");             /* pcscf */
+    parcel_write_i32(resp, 1500);             /* mtu */
+}
+
 /* -------------------------------------------------------------------
  * Main request handler
  * ------------------------------------------------------------------- */
@@ -586,6 +722,7 @@ static void handle_request(int client_fd, int bridge_fd,
         break;
     case RIL_REQUEST_SEND_SMS:
         data_json = request_data_send_sms(&req);
+        writer = response_send_sms;
         break;
     case RIL_REQUEST_ENTER_SIM_PIN:
         data_json = request_data_enter_pin(&req);
@@ -593,11 +730,23 @@ static void handle_request(int client_fd, int bridge_fd,
     case RIL_REQUEST_GET_IMEI:
         writer = (response_writer_t)response_string;
         break;
+    case RIL_REQUEST_GET_CURRENT_CALLS:
+        writer = response_current_calls;
+        break;
+    case RIL_REQUEST_DIAL:
+        data_json = request_data_dial(&req);
+        break;
+    case RIL_REQUEST_HANGUP:
+        data_json = request_data_hangup(&req);
+        break;
+    case RIL_REQUEST_ANSWER:
+        /* ANSWER has no request data */
+        break;
     case RIL_REQUEST_DATA_CALL_LIST:
+        writer = response_data_call_list;
+        break;
     case RIL_REQUEST_SET_INITIAL_ATTACH_APN:
     case RIL_REQUEST_SET_DATA_PROFILE:
-    case RIL_REQUEST_GET_CURRENT_CALLS:
-        /* These are handled by the bridge and return simple responses */
         break;
     default:
         LOGW("Unsupported RIL request: %d", request_id);
@@ -676,11 +825,23 @@ static void send_unsolicited(int client_fd, int indication_id, const char *data)
     case RIL_UNSOL_SIM_STATUS_CHANGED:
         /* No additional data */
         break;
+    case RIL_UNSOL_CALL_RING:
+        /* isGsm (int32) — for VoLTE calls, isGsm=0 */
+        parcel_write_i32(&resp, json_get_bool(data, "isGsm", 0));
+        break;
     case RIL_UNSOL_NEW_SMS:
         {
             char *pdu = json_get_str(data, "pdu");
             parcel_write_str16(&resp, pdu);
             free(pdu);
+        }
+        break;
+    case RIL_UNSOL_NITZ_TIME_RECEIVED:
+        {
+            /* NITZ time string, e.g. "26/03/03,12:00:00+00" */
+            char *nitz = json_get_str(data, "nitz");
+            parcel_write_str16(&resp, nitz ? nitz : "");
+            free(nitz);
         }
         break;
     default:
@@ -694,6 +855,51 @@ static void send_unsolicited(int client_fd, int indication_id, const char *data)
 }
 
 /* -------------------------------------------------------------------
+ * Bridge → Android unsolicited forwarder thread
+ *
+ * Reads length-prefixed JSON messages from the bridge TCP connection
+ * and converts them to Parcel-encoded unsolicited indications for
+ * the Android RILJ client.
+ * ------------------------------------------------------------------- */
+struct unsol_fwd_ctx {
+    int client_fd;
+    int bridge_fd;
+    volatile int *alive;
+};
+
+static void *unsol_forward_thread(void *arg) {
+    struct unsol_fwd_ctx *ctx = (struct unsol_fwd_ctx *)arg;
+    int bridge_fd = ctx->bridge_fd;
+    int client_fd = ctx->client_fd;
+
+    LOGI("Unsolicited forwarder started");
+
+    while (*(ctx->alive)) {
+        char *json = bridge_recv(bridge_fd);
+        if (!json) break;
+
+        int msg_type = json_get_int(json, "type", 0);
+        if (msg_type != RESPONSE_UNSOLICITED) {
+            /* This is a solicited response — shouldn't happen on the
+             * unsol-only bridge connection, but ignore gracefully. */
+            free(json);
+            continue;
+        }
+
+        int indication_id = json_get_int(json, "id", 0);
+        const char *data_part = json_find_data(json);
+
+        LOGI("Unsolicited: id=%d", indication_id);
+        send_unsolicited(client_fd, indication_id, data_part);
+        free(json);
+    }
+
+    LOGI("Unsolicited forwarder exiting");
+    free(ctx);
+    return NULL;
+}
+
+/* -------------------------------------------------------------------
  * Client handler (runs in a thread)
  * ------------------------------------------------------------------- */
 static volatile int running = 1;
@@ -702,7 +908,7 @@ static void *client_thread(void *arg) {
     int client_fd = *(int *)arg;
     free(arg);
 
-    /* Connect to the bridge */
+    /* Connect to the bridge for solicited requests */
     int bridge_fd = -1;
     for (int attempt = 0; attempt < 30 && bridge_fd < 0; attempt++) {
         bridge_fd = bridge_connect();
@@ -715,6 +921,23 @@ static void *client_thread(void *arg) {
         LOGE("Failed to connect to RIL bridge after 30 attempts");
         close(client_fd);
         return NULL;
+    }
+
+    /* Connect a second bridge connection for unsolicited indications.
+     * The bridge sends unsolicited messages on ANY connected client,
+     * so this second connection receives those independently. */
+    int unsol_bridge_fd = bridge_connect();
+    volatile int unsol_alive = 1;
+
+    if (unsol_bridge_fd >= 0) {
+        struct unsol_fwd_ctx *ctx = (struct unsol_fwd_ctx *)malloc(sizeof(*ctx));
+        ctx->client_fd = client_fd;
+        ctx->bridge_fd = unsol_bridge_fd;
+        ctx->alive = &unsol_alive;
+
+        pthread_t unsol_tid;
+        pthread_create(&unsol_tid, NULL, unsol_forward_thread, ctx);
+        pthread_detach(unsol_tid);
     }
 
     /* Send initial radio state indication */
@@ -749,7 +972,9 @@ static void *client_thread(void *arg) {
 
 done:
     LOGI("Client disconnected");
+    unsol_alive = 0;
     close(bridge_fd);
+    if (unsol_bridge_fd >= 0) close(unsol_bridge_fd);
     close(client_fd);
     return NULL;
 }

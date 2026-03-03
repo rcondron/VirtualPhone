@@ -71,7 +71,9 @@ class RILUnsol(IntEnum):
     """RIL unsolicited indication IDs."""
     RADIO_STATE_CHANGED = 1000
     NETWORK_STATE_CHANGED = 1001
+    CALL_RING = 1002
     NEW_SMS = 1003
+    NITZ_TIME_RECEIVED = 1008
     SIM_STATUS_CHANGED = 1019
 
 
@@ -209,6 +211,7 @@ class RILBridge:
             RILRequest.SIM_IO: self._handle_sim_io,
             RILRequest.SIM_AUTHENTICATION: self._handle_sim_auth,
             RILRequest.SEND_SMS: self._handle_send_sms,
+            RILRequest.SEND_SMS_EXPECT_MORE: self._handle_send_sms,
             RILRequest.ENTER_SIM_PIN: self._handle_enter_pin,
             RILRequest.DATA_CALL_LIST: self._handle_data_call_list,
             RILRequest.SET_INITIAL_ATTACH_APN: self._handle_set_initial_attach_apn,

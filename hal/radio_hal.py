@@ -24,6 +24,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import IntEnum
 from typing import Optional, Callable, Awaitable, TYPE_CHECKING
 
@@ -185,6 +186,8 @@ class RadioHAL:
             self.registration.mcc = profile.get("mcc", "")
             self.registration.mnc = profile.get("mnc", "")
             logger.info("SIM present: MCC=%s MNC=%s", self.registration.mcc, self.registration.mnc)
+            # Notify Android that SIM status changed
+            await self._send_indication(1019, {})  # SIM_STATUS_CHANGED
             # Start simulated network registration
             self._registration_task = asyncio.create_task(self._simulate_registration())
         else:
@@ -575,6 +578,12 @@ class RadioHAL:
             await asyncio.sleep(1)
             self.data_calls = [DataCall()]
             logger.info("Radio: default data call established on rmnet0")
+
+            # Phase 4: Send NITZ time (network time sync)
+            now = datetime.now(timezone.utc)
+            nitz_str = now.strftime("%y/%m/%d,%H:%M:%S+00")
+            await self._send_indication(1008, {"nitz": nitz_str})
+            logger.info("Radio: NITZ time sent: %s", nitz_str)
 
         except asyncio.CancelledError:
             pass
