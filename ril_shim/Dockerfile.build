@@ -1,0 +1,20 @@
+# Build the RIL shim as a static binary.
+#
+# Uses Alpine (musl libc) to produce a fully static binary
+# that works inside redroid's Android environment.
+#
+# Usage:
+#   docker build -f Dockerfile.build -t ril-shim-builder .
+#   docker run --rm -v $(pwd):/out ril-shim-builder cp /src/ril_shim /out/
+
+FROM alpine:3.19 AS builder
+
+RUN apk add --no-cache gcc musl-dev make linux-headers
+
+COPY ril_shim.c Makefile /src/
+WORKDIR /src
+RUN make CC=gcc CFLAGS="-static -O2 -Wall -Wextra -Wno-unused-parameter"
+
+# Copy to a known output location
+FROM scratch
+COPY --from=builder /src/ril_shim /ril_shim

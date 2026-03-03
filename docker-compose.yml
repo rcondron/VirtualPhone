@@ -1,6 +1,15 @@
 services:
   # =========================================================================
   # redroid - Android-in-Docker emulator
+  #
+  # The RIL shim replaces the stock rild inside redroid. It creates the
+  # /dev/socket/rild Unix socket, speaks the Android Parcel-based RIL
+  # protocol, and forwards requests to the vphone RIL bridge over TCP.
+  #
+  # Build the shim first:
+  #   docker build -f ril_shim/Dockerfile.build -o ril_shim/ ril_shim/
+  # Or:
+  #   cd ril_shim && make  (requires static gcc toolchain)
   # =========================================================================
   redroid:
     image: redroid/redroid:13.0.0-latest
@@ -10,16 +19,24 @@ services:
       - "5555:5555"
     volumes:
       - redroid-data:/data
-      - ./hal/ril_bridge.py:/vendor/ril_bridge.py:ro
+      - ./ril_shim/ril_shim:/vendor/bin/hw/ril_shim:ro
+    environment:
+      - RIL_BRIDGE_HOST=172.28.0.20
     command:
       - androidboot.redroid_gpu_mode=guest
       - androidboot.redroid_net_ndns=1
       - androidboot.hardware=ranchu
       - ro.telephony.default_network=13
       - persist.sys.timezone=UTC
+      - gsm.sim.state=READY
+      - gsm.operator.numeric=00101
+      - gsm.operator.alpha=VirtualPhone
+      - gsm.version.ril-impl=VirtualPhone RIL 1.0
     networks:
       telecom-net:
         ipv4_address: 172.28.0.10
+    depends_on:
+      - vphone
     profiles:
       - android
 

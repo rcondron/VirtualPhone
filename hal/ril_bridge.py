@@ -10,6 +10,16 @@ The bridge:
 2. Translates them into commands for the virtual eUICC
 3. Sends responses back in the RIL wire format
 
+The C-based RIL shim inside redroid connects to this bridge over TCP
+and translates between Android's Parcel protocol and our JSON format.
+
+Wire protocol (JSON over TCP, length-prefixed):
+  [4-byte big-endian length][JSON payload]
+
+Request:  {"type": 0, "serial": N, "id": <RIL_REQUEST>, "data": {...}}
+Response: {"type": 0, "serial": N, "id": <RIL_REQUEST>, "data": {...}}
+Unsol:    {"type": 1, "serial": 0, "id": <RIL_UNSOL>,   "data": {...}}
+
 Reference: Android RIL (hardware/ril/), ril.h
 """
 
@@ -37,11 +47,10 @@ class RILRequest(IntEnum):
     """RIL request IDs (from ril.h)."""
     GET_SIM_STATUS = 1
     ENTER_SIM_PIN = 2
-    GET_IMSI = 11
-    DIAL = 10
     GET_CURRENT_CALLS = 9
+    DIAL = 10
+    GET_IMSI = 11
     HANGUP = 12
-    ANSWER = 40
     SIGNAL_STRENGTH = 19
     VOICE_REG_STATE = 20
     DATA_REG_STATE = 21
@@ -51,11 +60,19 @@ class RILRequest(IntEnum):
     SEND_SMS_EXPECT_MORE = 26
     SIM_IO = 28
     GET_IMEI = 38
-    SIM_AUTHENTICATION = 125
-    SET_INITIAL_ATTACH_APN = 111
+    ANSWER = 40
     DATA_CALL_LIST = 57
+    SET_INITIAL_ATTACH_APN = 111
+    SIM_AUTHENTICATION = 125
     SET_DATA_PROFILE = 128
-    GET_ICC_CARD_STATUS = 1
+
+
+class RILUnsol(IntEnum):
+    """RIL unsolicited indication IDs."""
+    RADIO_STATE_CHANGED = 1000
+    NETWORK_STATE_CHANGED = 1001
+    NEW_SMS = 1003
+    SIM_STATUS_CHANGED = 1019
 
 
 class RILResponse(IntEnum):
@@ -73,7 +90,7 @@ class RILMessage:
     data: dict
 
     def serialize(self) -> bytes:
-        """Serialize to RIL wire format (simplified JSON-based)."""
+        """Serialize to RIL wire format (length-prefixed JSON)."""
         payload = json.dumps({
             "type": self.msg_type,
             "serial": self.serial,
@@ -98,7 +115,7 @@ class RILBridge:
     """
     RIL Bridge server.
 
-    Accepts connections from Android's RIL daemon (inside redroid)
+    Accepts connections from the C RIL shim (inside redroid)
     and forwards requests to the virtual RadioHAL.
     """
 
@@ -111,12 +128,15 @@ class RILBridge:
         self.port = port
         self.radio_hal = RadioHAL()
         self._server: Optional[asyncio.AbstractServer] = None
+        self._clients: list[asyncio.StreamWriter] = []
 
     async def start(self) -> None:
         """Start the RIL bridge server."""
         self._server = await asyncio.start_server(
             self._handle_client, self.host, self.port
         )
+        # Wire up unsolicited indication callback
+        self.radio_hal.set_indication_callback(self._broadcast_unsolicited)
         await self.radio_hal.power_on()
         logger.info("RIL bridge listening on %s:%d", self.host, self.port)
 
@@ -132,13 +152,14 @@ class RILBridge:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Handle a connected RIL client."""
+        """Handle a connected RIL client (C shim)."""
         addr = writer.get_extra_info("peername")
         logger.info("RIL client connected: %s", addr)
+        self._clients.append(writer)
 
         # Send initial unsolicited radio state indication
         await self._send_unsolicited(
-            writer, 1000,  # RIL_UNSOL_RESPONSE_RADIO_STATE_CHANGED
+            writer, RILUnsol.RADIO_STATE_CHANGED,
             {"radioState": self.radio_hal.radio_state.value},
         )
 
@@ -167,6 +188,7 @@ class RILBridge:
         except Exception:
             logger.exception("RIL bridge error for %s", addr)
         finally:
+            self._clients.remove(writer)
             writer.close()
             await writer.wait_closed()
 
@@ -178,13 +200,20 @@ class RILBridge:
         handlers = {
             RILRequest.GET_SIM_STATUS: self._handle_get_sim_status,
             RILRequest.GET_IMSI: self._handle_get_imsi,
+            RILRequest.GET_IMEI: self._handle_get_imei,
             RILRequest.OPERATOR: self._handle_get_operator,
             RILRequest.SIGNAL_STRENGTH: self._handle_signal_strength,
             RILRequest.VOICE_REG_STATE: self._handle_voice_reg,
             RILRequest.DATA_REG_STATE: self._handle_data_reg,
             RILRequest.RADIO_POWER: self._handle_radio_power,
+            RILRequest.SIM_IO: self._handle_sim_io,
             RILRequest.SIM_AUTHENTICATION: self._handle_sim_auth,
+            RILRequest.SEND_SMS: self._handle_send_sms,
             RILRequest.ENTER_SIM_PIN: self._handle_enter_pin,
+            RILRequest.DATA_CALL_LIST: self._handle_data_call_list,
+            RILRequest.SET_INITIAL_ATTACH_APN: self._handle_set_initial_attach_apn,
+            RILRequest.SET_DATA_PROFILE: self._handle_set_data_profile,
+            RILRequest.GET_CURRENT_CALLS: self._handle_get_current_calls,
         }
 
         handler = handlers.get(request_id)
@@ -201,12 +230,18 @@ class RILBridge:
             data=data,
         )
 
+    # -- Request handlers --
+
     async def _handle_get_sim_status(self, data: dict) -> dict:
         return await self.radio_hal.get_sim_status()
 
     async def _handle_get_imsi(self, data: dict) -> dict:
         imsi = await self.radio_hal.get_imsi()
         return {"imsi": imsi}
+
+    async def _handle_get_imei(self, data: dict) -> dict:
+        imei = await self.radio_hal.get_imei()
+        return {"imei": imei}
 
     async def _handle_get_operator(self, data: dict) -> dict:
         return await self.radio_hal.get_operator()
@@ -225,14 +260,57 @@ class RILBridge:
         await self.radio_hal.set_radio_power(on)
         return {"success": True}
 
+    async def _handle_sim_io(self, data: dict) -> dict:
+        return await self.radio_hal.sim_io(
+            command=data.get("command", 0),
+            file_id=data.get("fileId", 0),
+            path=data.get("path", ""),
+            p1=data.get("p1", 0),
+            p2=data.get("p2", 0),
+            p3=data.get("p3", 0),
+            data=data.get("data", ""),
+            pin2=data.get("pin2", ""),
+            aid=data.get("aid", ""),
+        )
+
     async def _handle_sim_auth(self, data: dict) -> dict:
         context = data.get("authContext", 0)
         auth_data = data.get("authData", "")
         return await self.radio_hal.sim_authentication(context, auth_data)
 
+    async def _handle_send_sms(self, data: dict) -> dict:
+        return await self.radio_hal.send_sms(
+            smsc_pdu=data.get("smscPdu", ""),
+            pdu=data.get("pdu", ""),
+        )
+
     async def _handle_enter_pin(self, data: dict) -> dict:
         pin = data.get("pin", "")
         return await self.radio_hal.supply_icc_pin(pin)
+
+    async def _handle_data_call_list(self, data: dict) -> dict:
+        return await self.radio_hal.get_data_call_list()
+
+    async def _handle_set_initial_attach_apn(self, data: dict) -> dict:
+        return await self.radio_hal.set_initial_attach_apn(data)
+
+    async def _handle_set_data_profile(self, data: dict) -> dict:
+        return await self.radio_hal.set_data_profile(data)
+
+    async def _handle_get_current_calls(self, data: dict) -> dict:
+        return await self.radio_hal.get_current_calls()
+
+    # -- Unsolicited indications --
+
+    async def _broadcast_unsolicited(
+        self, indication_id: int, data: dict
+    ) -> None:
+        """Broadcast an unsolicited indication to all connected clients."""
+        for writer in list(self._clients):
+            try:
+                await self._send_unsolicited(writer, indication_id, data)
+            except Exception:
+                logger.debug("Failed to send unsolicited to client")
 
     async def _send_unsolicited(
         self,

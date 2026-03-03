@@ -22,9 +22,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional, Callable
+from typing import Optional, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,18 @@ class NetworkRegistration:
     cid: int = 0
 
 
+@dataclass
+class DataCall:
+    """Active data call (PDP context)."""
+    cid: int = 1
+    active: int = 2        # 0=inactive, 1=dormant, 2=active
+    call_type: str = "IP"  # IP, IPV6, IPV4V6
+    ifname: str = "rmnet0"
+    addresses: list[str] = field(default_factory=lambda: ["10.45.0.2"])
+    dnses: list[str] = field(default_factory=lambda: ["172.28.0.50"])
+    gateways: list[str] = field(default_factory=lambda: ["10.45.0.1"])
+
+
 class RadioHAL:
     """
     Virtual Radio HAL implementation.
@@ -100,8 +113,14 @@ class RadioHAL:
         self.radio_state = RadioState.OFF
         self.sim_status = SimStatus()
         self.registration = NetworkRegistration()
-        self._response_callbacks: dict[str, Callable] = {}
-        self._indication_callbacks: dict[str, Callable] = {}
+        self.data_calls: list[DataCall] = []
+        self.imei = os.environ.get("VPHONE_IMEI", "358240051111110")
+        self._indication_callback: Optional[Callable[[int, dict], Awaitable[None]]] = None
+        self._registration_task: Optional[asyncio.Task] = None
+
+    def set_indication_callback(self, cb: Callable[[int, dict], Awaitable[None]]) -> None:
+        """Set callback for unsolicited indications."""
+        self._indication_callback = cb
 
     async def power_on(self) -> None:
         """Power on the virtual radio."""
@@ -115,6 +134,8 @@ class RadioHAL:
             self.registration.mcc = profile.get("mcc", "")
             self.registration.mnc = profile.get("mnc", "")
             logger.info("SIM present: MCC=%s MNC=%s", self.registration.mcc, self.registration.mnc)
+            # Start simulated network registration
+            self._registration_task = asyncio.create_task(self._simulate_registration())
         else:
             self.sim_status.card_state = 0  # absent
             logger.info("No SIM present")
@@ -124,6 +145,10 @@ class RadioHAL:
         logger.info("Radio HAL: powering off")
         self.radio_state = RadioState.OFF
         self.registration = NetworkRegistration()
+        self.data_calls.clear()
+        if self._registration_task:
+            self._registration_task.cancel()
+            self._registration_task = None
 
     async def get_sim_status(self) -> dict:
         """IRadio::getIccCardStatus() - Return SIM card status."""
@@ -160,6 +185,10 @@ class RadioHAL:
         """IRadio::getImsiForApp() - Return IMSI."""
         profile = await self._get_active_profile()
         return profile.get("imsi") if profile else None
+
+    async def get_imei(self) -> str:
+        """IRadio::getImei() - Return device IMEI."""
+        return self.imei
 
     async def get_operator(self) -> dict:
         """IRadio::getOperator() - Return operator information."""
@@ -205,6 +234,35 @@ class RadioHAL:
             },
         }
 
+    async def sim_io(self, command: int, file_id: int, path: str,
+                     p1: int, p2: int, p3: int,
+                     data: str = "", pin2: str = "", aid: str = "") -> dict:
+        """
+        IRadio::iccIOForApp() - Perform a SIM I/O command.
+
+        Maps to ISO 7816-4 APDU commands for file access.
+        """
+        # Build APDU from SIM_IO parameters
+        # command: 0xC0=GET_RESPONSE, 0xB0=READ_BINARY, 0xB2=READ_RECORD,
+        #          0xD6=UPDATE_BINARY, 0xDC=UPDATE_RECORD, 0xA4=SELECT
+        apdu = f"00{command:02x}{p1:02x}{p2:02x}"
+        if p3 > 0:
+            apdu += f"{p3:02x}"
+        if data:
+            apdu += data
+
+        resp = await self._send_euicc_message({
+            "type": "apdu",
+            "data": apdu,
+        })
+
+        sw = resp.get("sw", "9000")
+        return {
+            "sw1": int(sw[:2], 16),
+            "sw2": int(sw[2:4], 16),
+            "simResponse": resp.get("data", ""),
+        }
+
     async def sim_authentication(self, auth_context: int, auth_data: str) -> dict:
         """
         IRadio::requestIccSimAuthentication() - Run SIM authentication.
@@ -226,6 +284,20 @@ class RadioHAL:
             "simResponse": resp.get("data", ""),
         }
 
+    async def send_sms(self, smsc_pdu: str, pdu: str) -> dict:
+        """
+        IRadio::sendSms() - Send an SMS message.
+
+        In our virtual environment, SMS is sent over IMS (SMS-over-IP).
+        """
+        logger.info("Radio HAL: sendSms (pdu=%s...)", pdu[:20] if pdu else "empty")
+        # SMS over IMS will be implemented in Phase 5
+        return {
+            "messageRef": 1,
+            "ackPdu": "",
+            "errorCode": 0,
+        }
+
     async def supply_icc_pin(self, pin: str) -> dict:
         """IRadio::supplyIccPinForApp() - Verify PIN."""
         # Virtual eUICC doesn't require PIN by default
@@ -237,6 +309,96 @@ class RadioHAL:
             await self.power_on()
         else:
             await self.power_off()
+
+    async def get_data_call_list(self) -> dict:
+        """IRadio::getDataCallList() - Return active data calls."""
+        return {
+            "calls": [
+                {
+                    "cid": dc.cid,
+                    "active": dc.active,
+                    "type": dc.call_type,
+                    "ifname": dc.ifname,
+                    "addresses": dc.addresses,
+                    "dnses": dc.dnses,
+                    "gateways": dc.gateways,
+                }
+                for dc in self.data_calls
+            ],
+        }
+
+    async def set_initial_attach_apn(self, data: dict) -> dict:
+        """IRadio::setInitialAttachApn() - Set the initial attach APN."""
+        logger.info("Radio HAL: setInitialAttachApn(%s)", data.get("apn", ""))
+        return {"success": True}
+
+    async def set_data_profile(self, data: dict) -> dict:
+        """IRadio::setDataProfile() - Set data connection profiles."""
+        logger.info("Radio HAL: setDataProfile")
+        return {"success": True}
+
+    async def get_current_calls(self) -> dict:
+        """IRadio::getCurrentCalls() - Return active voice calls."""
+        # Voice calls will be implemented in Phase 6
+        return {"calls": []}
+
+    def get_radio_state(self) -> dict:
+        """Return the current radio state for the management API."""
+        return {
+            "radioState": self.radio_state.name,
+            "simPresent": self.sim_status.card_state == 1,
+            "registration": {
+                "state": self.registration.reg_state.name,
+                "rat": self.registration.rat.name,
+                "mcc": self.registration.mcc,
+                "mnc": self.registration.mnc,
+            },
+            "signalStrength": {
+                "rsrp": -95,
+                "rsrq": -10,
+            },
+            "imei": self.imei,
+            "dataCallsActive": len(self.data_calls),
+        }
+
+    async def _simulate_registration(self) -> None:
+        """
+        Simulate network registration after radio power-on.
+
+        Transitions: NOT_SEARCHING → SEARCHING → REGISTERED (LTE).
+        This simulates what a real modem does when it attaches to a network.
+        """
+        try:
+            # Phase 1: Searching
+            await asyncio.sleep(1)
+            self.registration.reg_state = RegState.NOT_REG_SEARCHING
+            logger.info("Radio: searching for network...")
+            await self._send_indication(1001, {})  # NETWORK_STATE_CHANGED
+
+            # Phase 2: Registered on LTE
+            await asyncio.sleep(2)
+            self.registration.reg_state = RegState.REG_HOME
+            self.registration.rat = NetworkType.LTE
+            self.registration.lac = 0x0001
+            self.registration.cid = 0x00000101
+            logger.info(
+                "Radio: registered on %s%s (LTE)",
+                self.registration.mcc, self.registration.mnc,
+            )
+            await self._send_indication(1001, {})  # NETWORK_STATE_CHANGED
+
+            # Phase 3: Establish default data call
+            await asyncio.sleep(1)
+            self.data_calls = [DataCall()]
+            logger.info("Radio: default data call established on rmnet0")
+
+        except asyncio.CancelledError:
+            pass
+
+    async def _send_indication(self, indication_id: int, data: dict) -> None:
+        """Send an unsolicited indication to the RIL bridge client."""
+        if self._indication_callback:
+            await self._indication_callback(indication_id, data)
 
     async def _get_active_profile(self) -> Optional[dict]:
         """Query the eUICC for the active profile."""

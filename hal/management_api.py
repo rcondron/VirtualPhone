@@ -426,3 +426,19 @@ async def get_vowifi_status():
             "pcscf_addresses": [],
             "dns_servers": [],
         }
+
+
+@app.get("/status/radio")
+async def get_radio_status():
+    """Get virtual radio / modem status (RIL bridge state)."""
+    try:
+        from hal.radio_hal import RadioHAL
+        # Return default state; in production the HAL singleton would be used
+        hal = RadioHAL()
+        return hal.get_radio_state()
+    except ImportError:
+        return {
+            "radioState": "UNAVAILABLE",
+            "simPresent": False,
+            "registration": {"state": "UNKNOWN", "rat": "UNKNOWN"},
+        }

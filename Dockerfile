@@ -39,7 +39,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Networking / IPsec (VoWiFi)
     strongswan \
     strongswan-charon \
+    strongswan-swanctl \
     libcharon-extra-plugins \
+    libstrongswan-extra-plugins \
     # TLS / crypto
     openssl \
     libssl3 \
@@ -47,6 +49,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsofia-sip-ua-glib3 \
     # Docker-in-Docker for redroid
     docker.io \
+    # Database (for simaka-sql quintuplets)
+    sqlite3 \
     # Utilities
     iproute2 \
     iptables \
