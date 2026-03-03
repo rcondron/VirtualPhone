@@ -39,7 +39,7 @@ services:
       - vphone-profiles:/var/lib/vphone/profiles
       - vphone-logs:/var/log/vphone
     ports:
-      - "9001:9000"     # eUICC management API
+      - "19000:9000"    # eUICC management API
       - "8443:8443"     # RSP callback
       - "5060:5060/udp" # SIP
       - "5061:5061/tcp" # SIP-TLS
