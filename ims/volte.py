@@ -45,6 +45,7 @@ from ims.sip_client import (
     SIPClient, SIPMessage, SIPStatus,
     generate_call_id, generate_branch, generate_tag,
 )
+from ims.media import MediaSession, parse_remote_rtp_address, parse_payload_type
 
 if TYPE_CHECKING:
     from hal.radio_hal import RadioHAL
@@ -117,6 +118,7 @@ class VoLTECall:
     remote_sdp: str = ""
     rtp_port: int = 0
     codec: str = ""
+    media_session: Optional[MediaSession] = field(default=None, repr=False)
 
 
 class VoLTECallManager:
@@ -267,6 +269,9 @@ class VoLTECallManager:
                 _volte_state["total_calls"] += 1
                 _volte_state["codec"] = call.codec
 
+                # Start media session
+                await self._start_media(call)
+
                 logger.info("VoLTE MO: call active (codec=%s, rtp=%d)",
                             call.codec, rtp_port)
                 return call_id
@@ -385,6 +390,9 @@ class VoLTECallManager:
         _volte_state["total_calls"] += 1
         _volte_state["codec"] = call.codec
 
+        # Start media session
+        await self._start_media(call)
+
         logger.info("VoLTE MT: call answered (codec=%s)", call.codec)
         return True
 
@@ -401,6 +409,9 @@ class VoLTECallManager:
         call = self._calls.pop(sip_call_id, None)
         if not call:
             return False
+
+        # Stop media session
+        await self._stop_media(call)
 
         if not self._sip_client or not self._started:
             return False
@@ -479,6 +490,8 @@ class VoLTECallManager:
         """Handle incoming BYE (remote party hangs up)."""
         call_id = msg.call_id
         call = self._calls.pop(call_id, None)
+        if call:
+            await self._stop_media(call)
 
         # Send 200 OK
         ok_response = SIPMessage(
@@ -516,6 +529,8 @@ class VoLTECallManager:
         """Handle incoming CANCEL (remote party cancels before answer)."""
         call_id = msg.call_id
         call = self._calls.pop(call_id, None)
+        if call:
+            await self._stop_media(call)
 
         # Send 200 OK for CANCEL
         ok = SIPMessage(
@@ -569,6 +584,38 @@ class VoLTECallManager:
         self._rtp_port_next += 2  # RTP uses even, RTCP uses odd
         return port
 
+    async def _start_media(self, call: VoLTECall) -> None:
+        """Start the RTP media session for a call."""
+        if not call.remote_sdp or not call.rtp_port:
+            return
+
+        remote_ip, remote_port = parse_remote_rtp_address(call.remote_sdp)
+        if not remote_port:
+            logger.warning("VoLTE: no remote RTP port in SDP")
+            return
+
+        pt = parse_payload_type(call.remote_sdp, call.codec)
+        session = MediaSession()
+        try:
+            await session.start(
+                local_port=call.rtp_port,
+                remote_ip=remote_ip,
+                remote_port=remote_port,
+                codec=call.codec,
+                payload_type=pt,
+            )
+            call.media_session = session
+            logger.info("VoLTE: media started for call %s", call.sip_call_id)
+        except Exception:
+            logger.exception("VoLTE: failed to start media for %s",
+                             call.sip_call_id)
+
+    async def _stop_media(self, call: VoLTECall) -> None:
+        """Stop the RTP media session for a call."""
+        if call.media_session:
+            await call.media_session.stop()
+            call.media_session = None
+
     def get_calls(self) -> list[dict]:
         """Return list of active calls for management API."""
         return [
@@ -579,6 +626,8 @@ class VoLTECallManager:
                 "number": c.remote_number,
                 "codec": c.codec,
                 "rtpPort": c.rtp_port,
+                "media": c.media_session.get_stats()
+                    if c.media_session else None,
             }
             for c in self._calls.values()
         ]

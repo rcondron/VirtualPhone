@@ -561,6 +561,20 @@ async def send_sms_api(req: SendSMSRequest):
         raise HTTPException(status_code=503, detail="SMS module not available")
 
 
+@app.get("/status/media")
+async def get_media_status():
+    """Get RTP media pipeline status (active sessions, packet stats)."""
+    try:
+        from ims.media import get_media_state
+        return get_media_state()
+    except ImportError:
+        return {
+            "active_sessions": 0,
+            "total_packets_sent": 0,
+            "total_packets_received": 0,
+        }
+
+
 @app.get("/status/radio")
 async def get_radio_status():
     """Get virtual radio / modem status (RIL bridge state)."""
