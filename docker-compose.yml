@@ -41,17 +41,17 @@ services:
     ports:
       - "${VPHONE_API_PORT:-19000}:9000"  # eUICC management API
       - "8443:8443"     # RSP callback
-      - "5060:5060/udp" # SIP
-      - "5061:5061/tcp" # SIP-TLS
     environment:
       - VPHONE_EUICC_EID=${EUICC_EID:-89001012012341234000000000000001}
       - VPHONE_RSP_SERVER=${RSP_SERVER:-}
       - VPHONE_IMS_DOMAIN=${IMS_DOMAIN:-ims.mnc001.mcc001.3gppnetwork.org}
-      - VPHONE_IMS_PROXY=${IMS_PROXY:-}
+      - VPHONE_IMS_PROXY=${IMS_PROXY:-172.28.0.41}
       - VPHONE_LOG_LEVEL=${LOG_LEVEL:-INFO}
       - VPHONE_API_KEY=${VPHONE_API_KEY:-}
       - REDROID_HOST=${REDROID_HOST:-}
       - REDROID_ADB_PORT=5555
+    dns:
+      - 172.28.0.50
     networks:
       telecom-net:
         ipv4_address: 172.28.0.20
@@ -62,6 +62,277 @@ services:
       timeout: 10s
       start_period: 60s
       retries: 3
+    depends_on:
+      pcscf:
+        condition: service_started
+    profiles:
+      - full
+      - vphone
+
+  # =========================================================================
+  # MongoDB - Subscriber database for Open5GS HSS
+  # =========================================================================
+  mongodb:
+    image: mongo:7
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.39
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # Open5GS HSS (Home Subscriber Server)
+  # Manages subscriber authentication vectors (Milenage AKA)
+  # =========================================================================
+  hss:
+    image: openverso/open5gs:2.7.0
+    command: open5gs-hssd
+    volumes:
+      - ./config/open5gs/hss.yaml:/opt/open5gs/etc/open5gs/hss.yaml:ro
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.40
+    depends_on:
+      - mongodb
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # Open5GS MME (Mobility Management Entity)
+  # =========================================================================
+  mme:
+    image: openverso/open5gs:2.7.0
+    command: open5gs-mmed
+    volumes:
+      - ./config/open5gs/mme.yaml:/opt/open5gs/etc/open5gs/mme.yaml:ro
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.30
+    depends_on:
+      - hss
+      - sgwc
+      - smf
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # Open5GS SGW-C (Serving Gateway - Control Plane)
+  # =========================================================================
+  sgwc:
+    image: openverso/open5gs:2.7.0
+    command: open5gs-sgwcd
+    volumes:
+      - ./config/open5gs/sgwc.yaml:/opt/open5gs/etc/open5gs/sgwc.yaml:ro
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.31
+    depends_on:
+      - sgwu
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # Open5GS SMF (Session Management Function) / PGW-C
+  # =========================================================================
+  smf:
+    image: openverso/open5gs:2.7.0
+    command: open5gs-smfd
+    volumes:
+      - ./config/open5gs/smf.yaml:/opt/open5gs/etc/open5gs/smf.yaml:ro
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.32
+    depends_on:
+      - upf
+      - pcrf
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # Open5GS SGW-U (Serving Gateway - User Plane)
+  # =========================================================================
+  sgwu:
+    image: openverso/open5gs:2.7.0
+    command: open5gs-sgwud
+    volumes:
+      - ./config/open5gs/sgwu.yaml:/opt/open5gs/etc/open5gs/sgwu.yaml:ro
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.33
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # Open5GS UPF (User Plane Function) / PGW-U
+  # =========================================================================
+  upf:
+    image: openverso/open5gs:2.7.0
+    command: open5gs-upfd
+    privileged: true
+    volumes:
+      - ./config/open5gs/upf.yaml:/opt/open5gs/etc/open5gs/upf.yaml:ro
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.34
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # Open5GS PCRF (Policy and Charging Rules Function)
+  # =========================================================================
+  pcrf:
+    image: openverso/open5gs:2.7.0
+    command: open5gs-pcrfd
+    volumes:
+      - ./config/open5gs/pcrf.yaml:/opt/open5gs/etc/open5gs/pcrf.yaml:ro
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.35
+    depends_on:
+      - mongodb
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # HSS Subscriber Provisioning (one-shot init container)
+  # Adds the test subscriber to the Open5GS HSS database
+  # =========================================================================
+  hss-provision:
+    image: mongo:7
+    volumes:
+      - ./scripts/provision_hss.sh:/provision.sh:ro
+    command: ["bash", "/provision.sh"]
+    environment:
+      - MONGO_HOST=mongodb
+      - MONGO_PORT=27017
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.36
+    depends_on:
+      - mongodb
+      - hss
+    restart: "no"
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # S-CSCF Auth Helper
+  # Bridges Kamailio S-CSCF <-> Open5GS HSS for AKA auth vectors
+  # =========================================================================
+  auth-helper:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./scripts/scscf_auth_helper.py:/app/scscf_auth_helper.py:ro
+      - ./euicc:/app/euicc:ro
+    command: >
+      sh -c "pip install -q pymongo && python /app/scscf_auth_helper.py"
+    environment:
+      - MONGO_HOST=mongodb
+      - MONGO_PORT=27017
+      - AUTH_HELPER_PORT=9080
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.44
+    depends_on:
+      - mongodb
+      - hss
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # Kamailio P-CSCF (Proxy-CSCF)
+  # First contact point for UE SIP REGISTER, relays to I-CSCF
+  # =========================================================================
+  pcscf:
+    image: kamailio/kamailio:5.7
+    volumes:
+      - ./config/kamailio/pcscf.cfg:/etc/kamailio/kamailio.cfg:ro
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.41
+    depends_on:
+      - icscf
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # Kamailio I-CSCF (Interrogating-CSCF)
+  # Routes registrations to the correct S-CSCF
+  # =========================================================================
+  icscf:
+    image: kamailio/kamailio:5.7
+    volumes:
+      - ./config/kamailio/icscf.cfg:/etc/kamailio/kamailio.cfg:ro
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.42
+    depends_on:
+      - scscf
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # Kamailio S-CSCF (Serving-CSCF)
+  # Handles SIP registration with AKA authentication
+  # =========================================================================
+  scscf:
+    image: kamailio/kamailio:5.7
+    volumes:
+      - ./config/kamailio/scscf.cfg:/etc/kamailio/kamailio.cfg:ro
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.43
+    depends_on:
+      - auth-helper
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
+
+  # =========================================================================
+  # CoreDNS - IMS domain DNS resolution
+  # Provides SRV records for IMS service discovery
+  # =========================================================================
+  dns:
+    image: coredns/coredns:1.11.1
+    volumes:
+      - ./config/dns/Corefile:/etc/coredns/Corefile:ro
+      - ./config/dns/db.ims:/etc/coredns/db.ims:ro
+      - ./config/dns/db.epc:/etc/coredns/db.epc:ro
+    command: ["-conf", "/etc/coredns/Corefile"]
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.50
+    restart: unless-stopped
+    profiles:
+      - full
+      - ims
 
 networks:
   telecom-net:
@@ -74,3 +345,4 @@ volumes:
   redroid-data:
   vphone-profiles:
   vphone-logs:
+  mongodb-data:

@@ -1,0 +1,63 @@
+#
+# Open5GS MME (Mobility Management Entity) configuration
+#
+logger:
+  level: info
+
+parameter:
+
+max:
+
+pool:
+
+mme:
+  freeDiameter:
+    identity: mme.localdomain
+    realm: localdomain
+    listen_on: 0.0.0.0
+    load_extension:
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dbg_msg_dumps.fdx
+        conf: 0x8888
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_rfc5777.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_mip6i.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_nasreq.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_nas_mipv6.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_dcca.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_dcca_3gpp.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_s6a.fdx
+    connect:
+      - identity: hss.localdomain
+        addr: 172.28.0.40
+
+  s1ap:
+    server:
+      - address: 0.0.0.0
+  gtpc:
+    server:
+      - address: 172.28.0.30
+    client:
+      sgwc:
+        - address: 172.28.0.31
+      smf:
+        - address: 172.28.0.32
+
+  gummei:
+    - plmn_id:
+        mcc: "001"
+        mnc: "01"
+      mme_gid: 1
+      mme_code: 1
+
+  tai:
+    - plmn_id:
+        mcc: "001"
+        mnc: "01"
+      tac: 1
+
+  security:
+    integrity_order: [EIA2, EIA1, EIA0]
+    ciphering_order: [EEA0, EEA1, EEA2]
+
+  network_name:
+    full: Virtual Operator
+    short: VirtOp

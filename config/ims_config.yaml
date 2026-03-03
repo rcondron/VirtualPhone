@@ -2,13 +2,14 @@
 ims:
   # IMS domain (derived from MCC/MNC if not set)
   # Format: ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org
-  domain: ""
+  domain: "ims.mnc001.mcc001.3gppnetwork.org"
 
   # P-CSCF (Proxy Call Session Control Function) address
+  # When using the local IMS core, points to the Kamailio P-CSCF container
   # For VoWiFi, this is discovered from the ePDG tunnel
   # For VoLTE, this comes from the PDN connection PCO
   pcscf:
-    address: ""
+    address: "172.28.0.41"
     port: 5060
 
   # SIP transport

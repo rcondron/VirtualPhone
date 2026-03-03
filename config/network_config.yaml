@@ -25,11 +25,11 @@ network:
       protocol: "IPV4V6"
       type: "ims"
 
-  # DNS
+  # DNS (use local CoreDNS for IMS domain resolution when IMS core is running)
   dns:
     servers:
+      - "172.28.0.50"  # Local CoreDNS (IMS domain)
       - "8.8.8.8"
-      - "8.8.4.4"
 
 # Docker networking
 docker:
@@ -37,6 +37,20 @@ docker:
   subnet: "172.28.0.0/24"
   redroid_ip: "172.28.0.10"
   vphone_ip: "172.28.0.20"
+  # IMS core addresses (assigned in docker-compose.yml)
+  mme_ip: "172.28.0.30"
+  sgwc_ip: "172.28.0.31"
+  smf_ip: "172.28.0.32"
+  sgwu_ip: "172.28.0.33"
+  upf_ip: "172.28.0.34"
+  pcrf_ip: "172.28.0.35"
+  mongodb_ip: "172.28.0.39"
+  hss_ip: "172.28.0.40"
+  pcscf_ip: "172.28.0.41"
+  icscf_ip: "172.28.0.42"
+  scscf_ip: "172.28.0.43"
+  auth_helper_ip: "172.28.0.44"
+  dns_ip: "172.28.0.50"
 
 # Logging
 logging:

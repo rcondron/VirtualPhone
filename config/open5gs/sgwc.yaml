@@ -1,0 +1,22 @@
+#
+# Open5GS SGW-C (Serving Gateway - Control Plane) configuration
+#
+logger:
+  level: info
+
+parameter:
+
+max:
+
+pool:
+
+sgwc:
+  gtpc:
+    server:
+      - address: 172.28.0.31
+  pfcp:
+    server:
+      - address: 172.28.0.31
+    client:
+      sgwu:
+        - address: 172.28.0.33

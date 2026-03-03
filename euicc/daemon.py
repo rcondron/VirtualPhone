@@ -134,6 +134,18 @@ class EUICCDaemon:
             ok = self.euicc.delete_profile(iccid)
             return {"type": "result", "success": ok}
 
+        elif msg_type == "get_profile_credentials":
+            iccid = msg.get("iccid", "")
+            profile = self.euicc.profiles.get(iccid)
+            if profile is None:
+                return {"type": "error", "message": f"Profile {iccid} not found"}
+            usim = profile.get_usim_data()
+            isim = profile.get_isim_data()
+            return {
+                "type": "credentials",
+                "data": {**usim, **(isim or {})},
+            }
+
         else:
             return {"type": "error", "message": f"Unknown message type: {msg_type}"}
 

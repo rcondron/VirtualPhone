@@ -1,0 +1,19 @@
+#
+# Open5GS SGW-U (Serving Gateway - User Plane) configuration
+#
+logger:
+  level: info
+
+parameter:
+
+max:
+
+pool:
+
+sgwu:
+  pfcp:
+    server:
+      - address: 172.28.0.33
+  gtpu:
+    server:
+      - address: 172.28.0.33

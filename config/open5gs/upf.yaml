@@ -1,0 +1,22 @@
+#
+# Open5GS UPF (User Plane Function) / PGW-U configuration
+#
+logger:
+  level: info
+
+parameter:
+
+max:
+
+pool:
+
+upf:
+  pfcp:
+    server:
+      - address: 172.28.0.34
+  gtpu:
+    server:
+      - address: 172.28.0.34
+  pdn:
+    - addr: 10.45.0.1/16
+    - addr: 10.46.0.1/16

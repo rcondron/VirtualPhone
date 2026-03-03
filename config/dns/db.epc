@@ -1,0 +1,28 @@
+; EPC domain zone file
+; Zone: epc.mnc001.mcc001.3gppnetwork.org
+;
+; DNS records for EPC node discovery (ePDG, PGW, etc.)
+
+$TTL 300
+$ORIGIN epc.mnc001.mcc001.3gppnetwork.org.
+
+@       IN      SOA     ns1.epc.mnc001.mcc001.3gppnetwork.org. admin.epc.mnc001.mcc001.3gppnetwork.org. (
+                        2024010101  ; Serial
+                        3600        ; Refresh
+                        900         ; Retry
+                        604800      ; Expire
+                        300         ; Negative Cache TTL
+                        )
+
+; Nameserver
+        IN      NS      ns1
+ns1     IN      A       172.28.0.50
+
+; ePDG (for VoWiFi)
+epdg    IN      A       172.28.0.20
+
+; PGW for IMS APN
+pgw     IN      A       172.28.0.32
+
+; NAI realm for EAP-AKA'
+nai     IN      A       172.28.0.20

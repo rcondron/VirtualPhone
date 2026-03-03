@@ -1,0 +1,43 @@
+; IMS domain zone file
+; Zone: ims.mnc001.mcc001.3gppnetwork.org
+;
+; Provides DNS records for IMS service discovery as per 3GPP TS 23.003
+
+$TTL 300
+$ORIGIN ims.mnc001.mcc001.3gppnetwork.org.
+
+@       IN      SOA     ns1.ims.mnc001.mcc001.3gppnetwork.org. admin.ims.mnc001.mcc001.3gppnetwork.org. (
+                        2024010101  ; Serial
+                        3600        ; Refresh
+                        900         ; Retry
+                        604800      ; Expire
+                        300         ; Negative Cache TTL
+                        )
+
+; Nameserver
+        IN      NS      ns1
+ns1     IN      A       172.28.0.50
+
+; P-CSCF discovery (SIP UDP/TCP)
+_sip._udp       IN      SRV     10 10 5060 pcscf
+_sip._tcp       IN      SRV     10 10 5060 pcscf
+
+; I-CSCF (for REGISTER routing)
+_sip._udp.icscf IN      SRV     10 10 5060 icscf
+_sip._tcp.icscf IN      SRV     10 10 5060 icscf
+
+; S-CSCF
+_sip._udp.scscf IN      SRV     10 10 5060 scscf
+_sip._tcp.scscf IN      SRV     10 10 5060 scscf
+
+; P-CSCF (Proxy CSCF)
+pcscf   IN      A       172.28.0.41
+
+; I-CSCF (Interrogating CSCF)
+icscf   IN      A       172.28.0.42
+
+; S-CSCF (Serving CSCF)
+scscf   IN      A       172.28.0.43
+
+; ENUM for MSISDN -> SIP URI mapping
+; (would normally be in e164.arpa but kept local for testing)

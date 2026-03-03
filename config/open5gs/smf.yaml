@@ -1,0 +1,50 @@
+#
+# Open5GS SMF (Session Management Function) / PGW-C configuration
+#
+logger:
+  level: info
+
+parameter:
+
+max:
+
+pool:
+
+smf:
+  freeDiameter:
+    identity: smf.localdomain
+    realm: localdomain
+    listen_on: 0.0.0.0
+    load_extension:
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dbg_msg_dumps.fdx
+        conf: 0x8888
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_rfc5777.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_mip6i.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_nasreq.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_nas_mipv6.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_dcca.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_dcca_3gpp.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_s6a.fdx
+    connect:
+      - identity: pcrf.localdomain
+        addr: 172.28.0.35
+
+  gtpc:
+    server:
+      - address: 172.28.0.32
+  pfcp:
+    server:
+      - address: 172.28.0.32
+    client:
+      upf:
+        - address: 172.28.0.34
+
+  pdn:
+    - addr: 10.45.0.1/16
+      apn: internet
+    - addr: 10.46.0.1/16
+      apn: ims
+
+  dns:
+    - 172.28.0.50
+    - 8.8.8.8

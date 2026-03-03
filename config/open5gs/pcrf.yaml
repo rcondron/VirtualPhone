@@ -1,0 +1,30 @@
+#
+# Open5GS PCRF (Policy and Charging Rules Function) configuration
+#
+logger:
+  level: info
+
+parameter:
+
+max:
+
+pool:
+
+pcrf:
+  freeDiameter:
+    identity: pcrf.localdomain
+    realm: localdomain
+    listen_on: 0.0.0.0
+    load_extension:
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dbg_msg_dumps.fdx
+        conf: 0x8888
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_rfc5777.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_mip6i.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_nasreq.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_nas_mipv6.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_dcca.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_dcca_3gpp.fdx
+      - module: /usr/lib/x86_64-linux-gnu/freeDiameter/dict_s6a.fdx
+    connect:
+      - identity: smf.localdomain
+        addr: 172.28.0.32

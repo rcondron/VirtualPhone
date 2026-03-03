@@ -399,11 +399,16 @@ async def delete_profile(iccid: str):
 @app.get("/status/ims")
 async def get_ims_status():
     """Get IMS registration status."""
-    return {
-        "registered": False,
-        "domain": os.environ.get("VPHONE_IMS_DOMAIN", ""),
-        "pcscf": os.environ.get("VPHONE_IMS_PROXY", ""),
-    }
+    try:
+        from ims.service import get_ims_state
+        return get_ims_state()
+    except ImportError:
+        return {
+            "registered": False,
+            "state": "unavailable",
+            "domain": os.environ.get("VPHONE_IMS_DOMAIN", ""),
+            "pcscf": os.environ.get("VPHONE_IMS_PROXY", ""),
+        }
 
 
 @app.get("/status/vowifi")

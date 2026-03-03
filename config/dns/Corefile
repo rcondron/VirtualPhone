@@ -1,0 +1,8 @@
+.:53 {
+    file /etc/coredns/db.ims ims.mnc001.mcc001.3gppnetwork.org
+    file /etc/coredns/db.epc epc.mnc001.mcc001.3gppnetwork.org
+    forward . 8.8.8.8 8.8.4.4
+    cache 60
+    log
+    errors
+}
