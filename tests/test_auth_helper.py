@@ -8,9 +8,11 @@ Tests cover:
 - AKA nonce format (base64(RAND || AUTN))
 - Response verification (XRES matching)
 - AUTN structure (SQN XOR AK || AMF || MAC-A)
+- Digest-AKA end-to-end verification (client ↔ server)
 """
 
 import base64
+import hashlib
 import os
 import pytest
 
@@ -151,3 +153,184 @@ class TestAuthVectorGeneration:
         # They should not be all zeros
         assert v["ck"] != bytes(16)
         assert v["ik"] != bytes(16)
+
+
+class TestDigestAKAVerification:
+    """Test end-to-end Digest-AKA flow matching client ↔ S-CSCF auth-helper."""
+
+    KI = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+    OPC = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+    AMF = bytes.fromhex("8000")
+    IMSI = "001010000000001"
+
+    def _server_generate_vector(self, sqn_val: int = 32):
+        """Simulate auth-helper generating an auth vector."""
+        mil = Milenage(self.KI, self.OPC)
+        rand = os.urandom(16)
+        sqn = sqn_val.to_bytes(6, "big")
+        mac_a = mil.f1(rand, sqn, self.AMF)
+        res, ck, ik, ak = mil.f2345(rand)
+        sqn_xor_ak = bytes(a ^ b for a, b in zip(sqn, ak))
+        autn = sqn_xor_ak + self.AMF + mac_a
+        nonce = base64.b64encode(rand + autn).decode()
+
+        mcc = self.IMSI[:3]
+        mnc = self.IMSI[3:5].zfill(3)
+        realm = f"ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org"
+
+        return {
+            "rand": rand, "autn": autn, "xres": res.hex(),
+            "ck": ck.hex(), "ik": ik.hex(), "nonce": nonce,
+            "realm": realm, "algorithm": "AKAv1-MD5",
+        }
+
+    def _client_compute_response(self, www_authenticate: str, impi: str, ki: bytes, opc: bytes, sqn: int = 0):
+        """Simulate the client-side AKA response computation (mirrors ims/registration.py)."""
+        # Parse WWW-Authenticate header
+        params = {}
+        for part in www_authenticate.replace("Digest ", "").split(","):
+            part = part.strip()
+            if "=" in part:
+                key, val = part.split("=", 1)
+                params[key.strip()] = val.strip().strip('"')
+
+        nonce = params["nonce"]
+        realm = params["realm"]
+        qop = params.get("qop", "auth")
+
+        # Decode nonce to get RAND and AUTN
+        nonce_bytes = base64.b64decode(nonce)
+        rand = nonce_bytes[:16]
+        autn = nonce_bytes[16:32]
+
+        # Run Milenage
+        mil = Milenage(ki, opc)
+        result = mil.authenticate(rand, autn, sqn)
+        assert result is not None, "AKA authentication failed"
+        res, ck, ik = result
+
+        # Digest password = hex-encoded RES (same as ims/registration.py)
+        password = res.hex()
+        uri = f"sip:{realm}"
+        cnonce = os.urandom(8).hex()
+        nc = "00000001"
+
+        ha1 = hashlib.md5(f"{impi}:{realm}:{password}".encode()).hexdigest()
+        ha2 = hashlib.md5(f"REGISTER:{uri}".encode()).hexdigest()
+        response = hashlib.md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()).hexdigest()
+
+        return {
+            "username": impi, "realm": realm, "nonce": nonce,
+            "uri": uri, "nc": nc, "cnonce": cnonce,
+            "qop": qop, "response": response,
+        }
+
+    def test_full_digest_aka_flow(self):
+        """End-to-end: server generates challenge, client responds, server verifies."""
+        from scripts.scscf_auth_helper import verify_digest_response, _vector_cache
+
+        # Server generates vector
+        vector = self._server_generate_vector()
+        _vector_cache[self.IMSI] = vector
+
+        # Server builds WWW-Authenticate
+        www_auth = (
+            f'Digest realm="{vector["realm"]}", '
+            f'nonce="{vector["nonce"]}", '
+            f'algorithm={vector["algorithm"]}, '
+            f'qop="auth"'
+        )
+
+        # Client computes Digest response
+        impi = f"{self.IMSI}@{vector['realm']}"
+        client_resp = self._client_compute_response(www_auth, impi, self.KI, self.OPC)
+
+        # Server verifies
+        result = verify_digest_response(
+            self.IMSI,
+            client_resp["username"], client_resp["realm"],
+            client_resp["uri"], client_resp["nc"],
+            client_resp["cnonce"], client_resp["qop"],
+            client_resp["response"],
+        )
+        assert result is True
+
+    def test_wrong_res_fails_verification(self):
+        """Digest response computed with wrong key should fail verification."""
+        from scripts.scscf_auth_helper import verify_digest_response, _vector_cache
+
+        vector = self._server_generate_vector()
+        _vector_cache[self.IMSI] = vector
+
+        www_auth = (
+            f'Digest realm="{vector["realm"]}", '
+            f'nonce="{vector["nonce"]}", '
+            f'algorithm={vector["algorithm"]}, '
+            f'qop="auth"'
+        )
+
+        # Client uses wrong key
+        wrong_ki = bytes.fromhex("ff" * 16)
+        wrong_opc = bytes.fromhex("ff" * 16)
+        # With wrong keys, Milenage.authenticate returns None, so we fabricate a fake response
+        result = verify_digest_response(
+            self.IMSI,
+            f"{self.IMSI}@{vector['realm']}", vector["realm"],
+            f"sip:{vector['realm']}", "00000001",
+            os.urandom(8).hex(), "auth",
+            os.urandom(16).hex(),  # random response — will not match
+        )
+        assert result is False
+
+    def test_no_cached_vector_fails(self):
+        """Verification fails when no vector was generated for the IMSI."""
+        from scripts.scscf_auth_helper import verify_digest_response, _vector_cache
+
+        # Clear cache
+        _vector_cache.pop("999990000000001", None)
+
+        result = verify_digest_response(
+            "999990000000001",
+            "user@realm", "realm", "sip:realm",
+            "00000001", "abc123", "auth", "deadbeef",
+        )
+        assert result is False
+
+    def test_verify_without_qop(self):
+        """Digest verification works without qop (RFC 2069 compatibility)."""
+        from scripts.scscf_auth_helper import verify_digest_response, _vector_cache
+
+        vector = self._server_generate_vector()
+        _vector_cache[self.IMSI] = vector
+
+        realm = vector["realm"]
+        impi = f"{self.IMSI}@{realm}"
+        uri = f"sip:{realm}"
+        password = vector["xres"]
+        nonce = vector["nonce"]
+
+        ha1 = hashlib.md5(f"{impi}:{realm}:{password}".encode()).hexdigest()
+        ha2 = hashlib.md5(f"REGISTER:{uri}".encode()).hexdigest()
+        response = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+
+        result = verify_digest_response(
+            self.IMSI, impi, realm, uri, "", "", "", response,
+        )
+        assert result is True
+
+    def test_challenge_header_format(self):
+        """The WWW-Authenticate header has correct format for AKAv1-MD5."""
+        vector = self._server_generate_vector()
+        www_auth = (
+            f'Digest realm="{vector["realm"]}", '
+            f'nonce="{vector["nonce"]}", '
+            f'algorithm={vector["algorithm"]}, '
+            f'qop="auth"'
+        )
+        assert 'realm="ims.mnc' in www_auth
+        assert 'algorithm=AKAv1-MD5' in www_auth
+        assert 'qop="auth"' in www_auth
+        # Nonce should be valid base64
+        nonce = vector["nonce"]
+        decoded = base64.b64decode(nonce)
+        assert len(decoded) == 32  # RAND (16) + AUTN (16)

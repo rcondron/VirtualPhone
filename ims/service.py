@@ -136,7 +136,7 @@ async def main():
         sqn = 0
 
     # Build IMS domain
-    domain = ims_domain or f"ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org"
+    domain = ims_domain or f"ims.mnc{mnc.zfill(3)}.mcc{mcc}.3gppnetwork.org"
 
     # ISIM identities (use profile data if available, else derive from IMSI)
     impi = cred_data.get("impi", f"{imsi}@{domain}") if cred_data else f"{imsi}@{domain}"

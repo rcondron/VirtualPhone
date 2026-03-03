@@ -8,14 +8,16 @@ generates RAND, AUTN, and XRES using the Milenage algorithm.
 
 The S-CSCF Kamailio instance calls this service to:
 1. Get an AKA challenge (RAND, AUTN) for a 401 response
-2. Verify the RES from an Authorization header
+2. Verify the Digest response from an Authorization header
 
 This replaces the need for a full Diameter Cx interface in the test environment.
 
 Endpoints:
-  GET  /auth/vector?imsi=<IMSI>   → {rand, autn, xres, ck, ik}
-  POST /auth/verify                → {success: bool}
-  GET  /health                     → {status: ok}
+  GET  /auth/vector?imsi=<IMSI>      → JSON {rand, autn, xres, ck, ik, nonce, realm, algorithm}
+  GET  /auth/challenge?imsi=<IMSI>   → Plain text WWW-Authenticate header value
+  GET  /auth/verify?imsi=...&...     → Plain text "OK" or "FAIL"
+  POST /auth/verify                   → JSON {success: bool}
+  GET  /health                        → JSON {status: ok}
 """
 
 from __future__ import annotations
@@ -25,7 +27,6 @@ import hashlib
 import json
 import logging
 import os
-import struct
 import sys
 from typing import Optional
 
@@ -78,7 +79,7 @@ def generate_auth_vector(imsi: str) -> Optional[dict]:
     """
     Generate an AKA authentication vector for a subscriber.
 
-    Returns {rand, autn, xres, ck, ik, nonce} or None if subscriber not found.
+    Returns {rand, autn, xres, ck, ik, nonce, realm, algorithm} or None if subscriber not found.
     """
     sub = get_subscriber(imsi)
     if not sub:
@@ -160,7 +161,7 @@ def generate_auth_vector(imsi: str) -> Optional[dict]:
 
 
 def verify_response(imsi: str, res_hex: str) -> bool:
-    """Verify the RES from an Authorization header against the expected XRES."""
+    """Verify the raw RES from an Authorization header against the expected XRES."""
     cached = _vector_cache.get(imsi)
     if not cached:
         logger.warning("No cached vector for IMSI %s", imsi)
@@ -176,6 +177,49 @@ def verify_response(imsi: str, res_hex: str) -> bool:
     return False
 
 
+def verify_digest_response(imsi: str, username: str, realm: str, uri: str,
+                           nc: str, cnonce: str, qop: str, response: str) -> bool:
+    """
+    Verify a Digest-AKA response from an Authorization header.
+
+    Computes the expected Digest response using the cached XRES as
+    the AKA password (hex-encoded RES), matching the client's computation
+    per RFC 3310 / 3GPP TS 33.203.
+    """
+    cached = _vector_cache.get(imsi)
+    if not cached:
+        logger.warning("No cached vector for IMSI %s", imsi)
+        return False
+
+    # The password for Digest-AKA is the hex-encoded RES
+    password = cached["xres"]
+    nonce = cached["nonce"]
+
+    # Compute HA1 = MD5(username:realm:password)
+    ha1 = hashlib.md5(f"{username}:{realm}:{password}".encode()).hexdigest()
+
+    # Compute HA2 = MD5(method:uri) — method is always REGISTER for registration
+    ha2 = hashlib.md5(f"REGISTER:{uri}".encode()).hexdigest()
+
+    # Compute expected response
+    if qop:
+        expected = hashlib.md5(
+            f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()
+        ).hexdigest()
+    else:
+        expected = hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
+
+    if response.lower() == expected.lower():
+        logger.info("Digest-AKA verification SUCCESS for IMSI %s", imsi)
+        return True
+
+    logger.warning(
+        "Digest-AKA verification FAILED for IMSI %s: got=%s expected=%s",
+        imsi, response[:8], expected[:8],
+    )
+    return False
+
+
 class AuthHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the auth helper."""
 
@@ -184,26 +228,68 @@ class AuthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
 
         if parsed.path == "/health":
-            self._respond(200, {"status": "ok"})
+            self._respond_json(200, {"status": "ok"})
             return
 
         if parsed.path == "/auth/vector":
-            params = parse_qs(parsed.query)
             imsi = params.get("imsi", [None])[0]
             if not imsi:
-                self._respond(400, {"error": "Missing imsi parameter"})
+                self._respond_json(400, {"error": "Missing imsi parameter"})
                 return
 
             vector = generate_auth_vector(imsi)
             if vector:
-                self._respond(200, vector)
+                self._respond_json(200, vector)
             else:
-                self._respond(404, {"error": f"Subscriber {imsi} not found"})
+                self._respond_json(404, {"error": f"Subscriber {imsi} not found"})
             return
 
-        self._respond(404, {"error": "Not found"})
+        if parsed.path == "/auth/challenge":
+            # Returns plain text WWW-Authenticate header value for Kamailio
+            imsi = params.get("imsi", [None])[0]
+            if not imsi:
+                self._respond_text(400, "Missing imsi parameter")
+                return
+
+            vector = generate_auth_vector(imsi)
+            if vector:
+                www_auth = (
+                    f'Digest realm="{vector["realm"]}", '
+                    f'nonce="{vector["nonce"]}", '
+                    f'algorithm={vector["algorithm"]}, '
+                    f'qop="auth"'
+                )
+                self._respond_text(200, www_auth)
+            else:
+                self._respond_text(404, f"Subscriber {imsi} not found")
+            return
+
+        if parsed.path == "/auth/verify":
+            # GET-based Digest verification for Kamailio (returns plain text OK/FAIL)
+            imsi = params.get("imsi", [None])[0]
+            username = params.get("username", [None])[0]
+            realm = params.get("realm", [None])[0]
+            uri = params.get("uri", [None])[0]
+            nc = params.get("nc", [None])[0]
+            cnonce = params.get("cnonce", [None])[0]
+            qop = params.get("qop", [None])[0]
+            response = params.get("response", [None])[0]
+
+            if not all([imsi, username, response]):
+                self._respond_text(400, "Missing required parameters")
+                return
+
+            success = verify_digest_response(
+                imsi, username, realm or "", uri or "",
+                nc or "", cnonce or "", qop or "", response,
+            )
+            self._respond_text(200, "OK" if success else "FAIL")
+            return
+
+        self._respond_json(404, {"error": "Not found"})
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -214,26 +300,32 @@ class AuthHandler(BaseHTTPRequestHandler):
             try:
                 data = json.loads(body)
             except json.JSONDecodeError:
-                self._respond(400, {"error": "Invalid JSON"})
+                self._respond_json(400, {"error": "Invalid JSON"})
                 return
 
             imsi = data.get("imsi", "")
             res_hex = data.get("res", "")
             if not imsi or not res_hex:
-                self._respond(400, {"error": "Missing imsi or res"})
+                self._respond_json(400, {"error": "Missing imsi or res"})
                 return
 
             success = verify_response(imsi, res_hex)
-            self._respond(200, {"success": success})
+            self._respond_json(200, {"success": success})
             return
 
-        self._respond(404, {"error": "Not found"})
+        self._respond_json(404, {"error": "Not found"})
 
-    def _respond(self, code: int, body: dict):
+    def _respond_json(self, code: int, body: dict):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(body).encode())
+
+    def _respond_text(self, code: int, text: str):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(text.encode())
 
 
 def main():
