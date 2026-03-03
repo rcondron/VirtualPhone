@@ -76,6 +76,7 @@ class IMSRegistration:
         self._registration_timer: Optional[asyncio.Task] = None
         self._call_id = generate_call_id()
         self._cseq = 1
+        self.service_route: Optional[str] = None
 
     async def register(self) -> bool:
         """
@@ -281,9 +282,10 @@ class IMSRegistration:
 
     def _process_200ok(self, response: SIPMessage) -> None:
         """Process a 200 OK registration response."""
-        # Extract Service-Route header for future requests
+        # Extract Service-Route header for future requests (used in INVITE Route header)
         service_route = response.headers.get("Service-Route")
         if service_route:
+            self.service_route = service_route
             logger.info("Service-Route: %s", service_route)
 
         # Extract P-Associated-URI (registered public identities)

@@ -443,6 +443,78 @@ async def get_sms_status():
         }
 
 
+@app.get("/status/volte")
+async def get_volte_status():
+    """Get VoLTE call manager status and active calls."""
+    try:
+        from ims.volte import get_volte_state
+        state = get_volte_state()
+        # Add active call details if available
+        from ims import _volte_manager_ref
+        if _volte_manager_ref.instance:
+            state["calls"] = _volte_manager_ref.instance.get_calls()
+        return state
+    except ImportError:
+        return {
+            "enabled": False,
+            "active_calls": 0,
+            "total_calls": 0,
+            "codec": None,
+        }
+
+
+class DialRequest(BaseModel):
+    """Request body for initiating a voice call via management API."""
+    number: str
+
+
+@app.post("/calls/dial")
+async def dial_call(req: DialRequest):
+    """
+    Initiate an outgoing VoLTE voice call.
+
+    This bypasses the Android RIL path and dials directly through
+    the VoLTE call manager (useful for testing).
+    """
+    try:
+        from ims import _volte_manager_ref
+        mgr = _volte_manager_ref.instance
+        if not mgr:
+            raise HTTPException(status_code=503, detail="VoLTE call manager not running")
+
+        call_id = await mgr.initiate_call(req.number, 0)
+        if call_id:
+            return {"success": True, "callId": call_id}
+        raise HTTPException(status_code=502, detail="Call initiation failed")
+    except ImportError:
+        raise HTTPException(status_code=503, detail="VoLTE module not available")
+
+
+@app.post("/calls/hangup")
+async def hangup_call(call_id: str = ""):
+    """
+    Hang up a VoLTE voice call.
+
+    If call_id is empty, hangs up all active calls.
+    """
+    try:
+        from ims import _volte_manager_ref
+        mgr = _volte_manager_ref.instance
+        if not mgr:
+            raise HTTPException(status_code=503, detail="VoLTE call manager not running")
+
+        if call_id:
+            result = await mgr.hangup_call(call_id)
+            return {"success": result}
+        else:
+            # Hangup all
+            for c in list(mgr._calls.values()):
+                await mgr.hangup_call(c.sip_call_id)
+            return {"success": True}
+    except ImportError:
+        raise HTTPException(status_code=503, detail="VoLTE module not available")
+
+
 class SendSMSRequest(BaseModel):
     """Request body for sending an SMS via the management API."""
     to: str

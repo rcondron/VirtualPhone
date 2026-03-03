@@ -22,6 +22,7 @@ from ims.registration import IMSRegistration, IMSCredentials, IMSConfig, IMSRegS
 from ims.vowifi import VoWiFiTunnel, VoWiFiConfig, get_vowifi_state
 from ims.sms import SMSoverIMS, SMSConfig
 from ims.sms_bridge import PSTNBridge, PSTNBridgeConfig
+from ims.volte import VoLTECallManager, VoLTEConfig
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get("VPHONE_LOG_LEVEL", "INFO")),
@@ -210,6 +211,25 @@ async def main():
             "registered": False,
             "state": reg.state.value,
         })
+
+    # Start VoLTE call manager
+    service_route = reg.service_route or ""
+    volte_config = VoLTEConfig(
+        pcscf_address=ims_proxy,
+        pcscf_port=5060,
+        transport="UDP",
+        impu=impu,
+        impi=impi,
+        home_domain=home_domain,
+        service_route=service_route,
+    )
+    volte_mgr = VoLTECallManager(volte_config)
+    await volte_mgr.start()
+    logger.info("VoLTE call manager started")
+
+    # Register VoLTE manager reference for management API
+    from ims import _volte_manager_ref
+    _volte_manager_ref.instance = volte_mgr
 
     # Start SMS over IMS service
     sms_service = SMSoverIMS(SMSConfig(

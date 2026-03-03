@@ -214,6 +214,9 @@ class RILBridge:
             RILRequest.SET_INITIAL_ATTACH_APN: self._handle_set_initial_attach_apn,
             RILRequest.SET_DATA_PROFILE: self._handle_set_data_profile,
             RILRequest.GET_CURRENT_CALLS: self._handle_get_current_calls,
+            RILRequest.DIAL: self._handle_dial,
+            RILRequest.HANGUP: self._handle_hangup,
+            RILRequest.ANSWER: self._handle_answer,
         }
 
         handler = handlers.get(request_id)
@@ -299,6 +302,18 @@ class RILBridge:
 
     async def _handle_get_current_calls(self, data: dict) -> dict:
         return await self.radio_hal.get_current_calls()
+
+    async def _handle_dial(self, data: dict) -> dict:
+        number = data.get("address", "")
+        clir = data.get("clir", 0)
+        return await self.radio_hal.dial(number, clir)
+
+    async def _handle_hangup(self, data: dict) -> dict:
+        call_index = data.get("callIndex", data.get("gsmIndex", 1))
+        return await self.radio_hal.hangup(call_index)
+
+    async def _handle_answer(self, data: dict) -> dict:
+        return await self.radio_hal.answer()
 
     # -- Unsolicited indications --
 

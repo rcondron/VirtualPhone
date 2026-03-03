@@ -29,6 +29,7 @@ from typing import Optional, Callable, Awaitable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ims.sms import SMSoverIMS
+    from ims.volte import VoLTECallManager
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,41 @@ class DataCall:
     gateways: list[str] = field(default_factory=lambda: ["10.45.0.1"])
 
 
+class CallState(IntEnum):
+    """Android call state values (from DriverCall.State)."""
+    ACTIVE = 0
+    HOLDING = 1
+    DIALING = 2
+    ALERTING = 3
+    INCOMING = 4
+    WAITING = 5
+
+
+@dataclass
+class VoiceCall:
+    """An active voice call tracked by the Radio HAL."""
+    index: int = 1             # 1-based call index
+    state: CallState = CallState.DIALING
+    is_mt: bool = False        # True = mobile-terminated (incoming)
+    is_mpty: bool = False      # Multi-party (conference)
+    number: str = ""           # Remote party number
+    name: str = ""             # Remote party name (if available)
+    number_presentation: int = 0  # 0=allowed, 1=restricted, 2=not available
+    sip_call_id: str = ""      # SIP Call-ID for IMS correlation
+
+    def to_ril_dict(self) -> dict:
+        """Serialize to RIL getCurrentCalls format."""
+        return {
+            "state": self.state.value,
+            "index": self.index,
+            "isMT": self.is_mt,
+            "isMpty": self.is_mpty,
+            "number": self.number,
+            "name": self.name,
+            "numberPresentation": self.number_presentation,
+        }
+
+
 class RadioHAL:
     """
     Virtual Radio HAL implementation.
@@ -121,6 +157,9 @@ class RadioHAL:
         self._indication_callback: Optional[Callable[[int, dict], Awaitable[None]]] = None
         self._registration_task: Optional[asyncio.Task] = None
         self._sms_service: Optional[SMSoverIMS] = None
+        self._call_manager: Optional[VoLTECallManager] = None
+        self.voice_calls: list[VoiceCall] = []
+        self._next_call_index: int = 1
 
     def set_indication_callback(self, cb: Callable[[int, dict], Awaitable[None]]) -> None:
         """Set callback for unsolicited indications."""
@@ -129,6 +168,10 @@ class RadioHAL:
     def set_sms_service(self, sms: SMSoverIMS) -> None:
         """Set the SMS-over-IMS service for MO/MT SMS routing."""
         self._sms_service = sms
+
+    def set_call_manager(self, mgr: VoLTECallManager) -> None:
+        """Set the VoLTE call manager for voice call routing."""
+        self._call_manager = mgr
 
     async def power_on(self) -> None:
         """Power on the virtual radio."""
@@ -154,6 +197,7 @@ class RadioHAL:
         self.radio_state = RadioState.OFF
         self.registration = NetworkRegistration()
         self.data_calls.clear()
+        self.voice_calls.clear()
         if self._registration_task:
             self._registration_task.cancel()
             self._registration_task = None
@@ -372,8 +416,115 @@ class RadioHAL:
 
     async def get_current_calls(self) -> dict:
         """IRadio::getCurrentCalls() - Return active voice calls."""
-        # Voice calls will be implemented in Phase 6
-        return {"calls": []}
+        return {
+            "calls": [c.to_ril_dict() for c in self.voice_calls],
+        }
+
+    async def dial(self, number: str, clir: int = 0) -> dict:
+        """
+        IRadio::dial() - Initiate an outgoing (MO) voice call.
+
+        Creates a VoiceCall in DIALING state and triggers SIP INVITE
+        via the VoLTE call manager.
+        """
+        logger.info("Radio HAL: dial(%s)", number)
+
+        call = VoiceCall(
+            index=self._next_call_index,
+            state=CallState.DIALING,
+            is_mt=False,
+            number=number,
+        )
+        self._next_call_index += 1
+        self.voice_calls.append(call)
+
+        # Notify Android of call state change
+        await self._send_indication(1001, {})  # CALL_STATE_CHANGED uses same id
+
+        # Start SIP INVITE via VoLTE call manager
+        if self._call_manager:
+            sip_call_id = await self._call_manager.initiate_call(number, call.index)
+            if sip_call_id:
+                call.sip_call_id = sip_call_id
+            else:
+                # INVITE failed — mark call as ended
+                self.voice_calls.remove(call)
+                await self._send_indication(1001, {})
+                return {"success": False, "error": "INVITE failed"}
+
+        return {"success": True, "callIndex": call.index}
+
+    async def answer(self) -> dict:
+        """IRadio::acceptCall() - Answer an incoming (MT) call."""
+        for call in self.voice_calls:
+            if call.state == CallState.INCOMING:
+                logger.info("Radio HAL: answer call %d from %s", call.index, call.number)
+                call.state = CallState.ACTIVE
+                await self._send_indication(1001, {})
+
+                if self._call_manager:
+                    await self._call_manager.answer_call(call.sip_call_id)
+
+                return {"success": True}
+
+        return {"success": False, "error": "No incoming call"}
+
+    async def hangup(self, call_index: int) -> dict:
+        """IRadio::hangup() - Terminate a voice call."""
+        for call in self.voice_calls:
+            if call.index == call_index:
+                logger.info("Radio HAL: hangup call %d", call_index)
+
+                if self._call_manager and call.sip_call_id:
+                    await self._call_manager.hangup_call(call.sip_call_id)
+
+                self.voice_calls.remove(call)
+                await self._send_indication(1001, {})
+                return {"success": True}
+
+        return {"success": False, "error": "Call not found"}
+
+    async def hangup_all(self) -> dict:
+        """Hangup all active calls."""
+        for call in list(self.voice_calls):
+            if self._call_manager and call.sip_call_id:
+                await self._call_manager.hangup_call(call.sip_call_id)
+        self.voice_calls.clear()
+        await self._send_indication(1001, {})
+        return {"success": True}
+
+    async def update_call_state(self, call_index: int,
+                                new_state: CallState) -> None:
+        """Update the state of a call (called by VoLTE call manager)."""
+        for call in self.voice_calls:
+            if call.index == call_index:
+                old_state = call.state
+                call.state = new_state
+                logger.info("Radio HAL: call %d %s → %s",
+                            call_index, old_state.name, new_state.name)
+                await self._send_indication(1001, {})
+                return
+
+    async def incoming_call(self, number: str, sip_call_id: str) -> None:
+        """
+        Notify Android of an incoming (MT) call.
+
+        Called by VoLTE call manager when a SIP INVITE is received.
+        """
+        call = VoiceCall(
+            index=self._next_call_index,
+            state=CallState.INCOMING,
+            is_mt=True,
+            number=number,
+            sip_call_id=sip_call_id,
+        )
+        self._next_call_index += 1
+        self.voice_calls.append(call)
+
+        logger.info("Radio HAL: incoming call %d from %s", call.index, number)
+        # RIL_UNSOL_CALL_RING = 1002
+        await self._send_indication(1002, {"isGsm": False})
+        await self._send_indication(1001, {})
 
     def get_radio_state(self) -> dict:
         """Return the current radio state for the management API."""

@@ -17,4 +17,10 @@ class _SMSServiceRef:
     instance: Optional["ims.sms.SMSoverIMS"] = None
 
 
+class _VoLTEManagerRef:
+    """Module-level reference to the running VoLTE call manager (for management API)."""
+    instance: Optional["ims.volte.VoLTECallManager"] = None
+
+
 _sms_service_ref = _SMSServiceRef()
+_volte_manager_ref = _VoLTEManagerRef()
