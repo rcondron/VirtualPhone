@@ -18,11 +18,14 @@ $ORIGIN epc.mnc001.mcc001.3gppnetwork.org.
         IN      NS      ns1
 ns1     IN      A       172.28.0.50
 
-; ePDG (for VoWiFi)
-epdg    IN      A       172.28.0.20
+; ePDG (for VoWiFi) - strongSwan IKEv2/EAP-AKA gateway
+epdg    IN      A       172.28.0.45
+
+; SRV record for ePDG discovery (3GPP TS 23.003)
+_epdg._tcp      IN      SRV     10 10 500 epdg
 
 ; PGW for IMS APN
 pgw     IN      A       172.28.0.32
 
 ; NAI realm for EAP-AKA'
-nai     IN      A       172.28.0.20
+nai     IN      A       172.28.0.45

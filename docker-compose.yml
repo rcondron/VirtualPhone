@@ -38,6 +38,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - vphone-profiles:/var/lib/vphone/profiles
       - vphone-logs:/var/log/vphone
+      - epdg-data:/var/lib/epdg:ro
     ports:
       - "${VPHONE_API_PORT:-19000}:9000"  # eUICC management API
       - "8443:8443"     # RSP callback
@@ -46,6 +47,7 @@ services:
       - VPHONE_RSP_SERVER=${RSP_SERVER:-}
       - VPHONE_IMS_DOMAIN=${IMS_DOMAIN:-ims.mnc001.mcc001.3gppnetwork.org}
       - VPHONE_IMS_PROXY=${IMS_PROXY:-172.28.0.41}
+      - VPHONE_VOWIFI_EPDG=${VOWIFI_EPDG:-}
       - VPHONE_LOG_LEVEL=${LOG_LEVEL:-INFO}
       - VPHONE_API_KEY=${VPHONE_API_KEY:-}
       - REDROID_HOST=${REDROID_HOST:-}
@@ -316,6 +318,58 @@ services:
       - ims
 
   # =========================================================================
+  # ePDG (Evolved Packet Data Gateway) for VoWiFi
+  # strongSwan IKEv2/IPsec gateway with EAP-AKA authentication
+  # =========================================================================
+  epdg:
+    build:
+      context: ./config/epdg
+      dockerfile: Dockerfile
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - epdg-data:/var/lib/epdg
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.45
+    depends_on:
+      epdg-provision:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    profiles:
+      - full
+      - vowifi
+
+  # =========================================================================
+  # ePDG Quintuplet Provisioning (one-shot init container)
+  # Generates EAP-AKA quintuplets from subscriber Ki/OPc for simaka-sql
+  # =========================================================================
+  epdg-provision:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./scripts/provision_epdg.py:/app/provision_epdg.py:ro
+      - ./euicc:/app/euicc:ro
+      - epdg-data:/var/lib/epdg
+    command: >
+      sh -c "pip install -q pymongo && python /app/provision_epdg.py --wait-mongo --count 50"
+    environment:
+      - MONGO_HOST=mongodb
+      - MONGO_PORT=27017
+      - EPDG_DB_PATH=/var/lib/epdg/aka_quintuplets.db
+    networks:
+      telecom-net:
+        ipv4_address: 172.28.0.46
+    depends_on:
+      - mongodb
+      - hss-provision
+    restart: "no"
+    profiles:
+      - full
+      - vowifi
+
+  # =========================================================================
   # CoreDNS - IMS domain DNS resolution
   # Provides SRV records for IMS service discovery
   # =========================================================================
@@ -346,3 +400,4 @@ volumes:
   vphone-profiles:
   vphone-logs:
   mongodb-data:
+  epdg-data:

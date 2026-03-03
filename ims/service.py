@@ -19,7 +19,7 @@ import os
 import signal
 
 from ims.registration import IMSRegistration, IMSCredentials, IMSConfig, IMSRegState
-from ims.vowifi import VoWiFiTunnel, VoWiFiConfig
+from ims.vowifi import VoWiFiTunnel, VoWiFiConfig, get_vowifi_state
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get("VPHONE_LOG_LEVEL", "INFO")),
@@ -143,7 +143,8 @@ async def main():
     impu = cred_data.get("impu", f"sip:{imsi}@{domain}") if cred_data else f"sip:{imsi}@{domain}"
     home_domain = cred_data.get("home_domain", domain) if cred_data else domain
 
-    # VoWiFi: Establish IPsec tunnel first
+    # VoWiFi: Establish IPsec tunnel first (with real credentials for EAP-AKA)
+    vowifi = None
     if vowifi_epdg:
         logger.info("VoWiFi mode: connecting to ePDG %s", vowifi_epdg)
         vowifi = VoWiFiTunnel(VoWiFiConfig(
@@ -151,12 +152,16 @@ async def main():
             mcc=mcc,
             mnc=mnc,
             imsi=imsi,
+            ki=ki,
+            opc=opc,
+            sqn=sqn,
         ))
         if await vowifi.connect():
-            logger.info("VoWiFi tunnel established")
-            # Use P-CSCF from tunnel
+            logger.info("VoWiFi tunnel established (IP=%s)", vowifi.tunnel_ip)
+            # Use P-CSCF from tunnel if available
             if vowifi.pcscf_address:
                 ims_proxy = vowifi.pcscf_address
+                logger.info("Using P-CSCF from VoWiFi tunnel: %s", ims_proxy)
         else:
             logger.error("VoWiFi tunnel failed, falling back to direct IMS")
 

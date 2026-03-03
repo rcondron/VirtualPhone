@@ -414,7 +414,15 @@ async def get_ims_status():
 @app.get("/status/vowifi")
 async def get_vowifi_status():
     """Get VoWiFi tunnel status."""
-    return {
-        "tunnel_up": False,
-        "epdg": os.environ.get("VPHONE_VOWIFI_EPDG", ""),
-    }
+    try:
+        from ims.vowifi import get_vowifi_state
+        return get_vowifi_state()
+    except ImportError:
+        return {
+            "state": "unavailable",
+            "tunnel_up": False,
+            "epdg": os.environ.get("VPHONE_VOWIFI_EPDG", ""),
+            "tunnel_ip": None,
+            "pcscf_addresses": [],
+            "dns_servers": [],
+        }
