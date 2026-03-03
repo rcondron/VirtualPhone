@@ -20,6 +20,8 @@ import signal
 
 from ims.registration import IMSRegistration, IMSCredentials, IMSConfig, IMSRegState
 from ims.vowifi import VoWiFiTunnel, VoWiFiConfig, get_vowifi_state
+from ims.sms import SMSoverIMS, SMSConfig
+from ims.sms_bridge import PSTNBridge, PSTNBridgeConfig
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get("VPHONE_LOG_LEVEL", "INFO")),
@@ -208,6 +210,33 @@ async def main():
             "registered": False,
             "state": reg.state.value,
         })
+
+    # Start SMS over IMS service
+    sms_service = SMSoverIMS(SMSConfig(
+        pcscf_address=ims_proxy,
+        pcscf_port=5060,
+        transport="UDP",
+        impu=impu,
+        impi=impi,
+        home_domain=home_domain,
+    ))
+    await sms_service.start()
+
+    # Register SMS service reference for management API
+    from ims import _sms_service_ref
+    _sms_service_ref.instance = sms_service
+
+    # Start optional PSTN SMS bridge
+    pstn_config = PSTNBridgeConfig.from_env()
+    pstn_bridge = PSTNBridge(pstn_config)
+    if pstn_bridge.enabled:
+        async def _pstn_incoming(from_number: str, text: str) -> None:
+            """Route incoming PSTN SMS to the IMS MT-SMS path."""
+            await sms_service.deliver_mt_sms(from_number, text)
+
+        pstn_bridge.set_mt_callback(_pstn_incoming)
+        await pstn_bridge.start()
+        logger.info("PSTN SMS bridge started (provider=%s)", pstn_config.provider)
 
     # Keep the service running and update state
     while True:

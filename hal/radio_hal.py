@@ -25,7 +25,10 @@ import logging
 import os
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional, Callable, Awaitable
+from typing import Optional, Callable, Awaitable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ims.sms import SMSoverIMS
 
 logger = logging.getLogger(__name__)
 
@@ -117,10 +120,15 @@ class RadioHAL:
         self.imei = os.environ.get("VPHONE_IMEI", "358240051111110")
         self._indication_callback: Optional[Callable[[int, dict], Awaitable[None]]] = None
         self._registration_task: Optional[asyncio.Task] = None
+        self._sms_service: Optional[SMSoverIMS] = None
 
     def set_indication_callback(self, cb: Callable[[int, dict], Awaitable[None]]) -> None:
         """Set callback for unsolicited indications."""
         self._indication_callback = cb
+
+    def set_sms_service(self, sms: SMSoverIMS) -> None:
+        """Set the SMS-over-IMS service for MO/MT SMS routing."""
+        self._sms_service = sms
 
     async def power_on(self) -> None:
         """Power on the virtual radio."""
@@ -288,15 +296,40 @@ class RadioHAL:
         """
         IRadio::sendSms() - Send an SMS message.
 
-        In our virtual environment, SMS is sent over IMS (SMS-over-IP).
+        Routes through SMSoverIMS for SIP MESSAGE delivery if available,
+        otherwise returns a placeholder success.
         """
         logger.info("Radio HAL: sendSms (pdu=%s...)", pdu[:20] if pdu else "empty")
-        # SMS over IMS will be implemented in Phase 5
+
+        if self._sms_service:
+            return await self._sms_service.send_sms(smsc_pdu, pdu)
+
+        # Fallback when SMS service is not wired
         return {
             "messageRef": 1,
             "ackPdu": "",
             "errorCode": 0,
         }
+
+    async def deliver_incoming_sms(self, from_number: str, to_number: str,
+                                   text: str) -> None:
+        """
+        Deliver an incoming SMS to Android via NEW_SMS unsolicited indication.
+
+        Called by SMSoverIMS when a SIP MESSAGE is received (MT-SMS path).
+        Builds an SMS-DELIVER TPDU and sends it via RIL unsolicited NEW_SMS.
+        """
+        from ims.sms_pdu import SMSDeliver, build_pdu_for_ril
+
+        deliver = SMSDeliver.create(from_number=from_number, text=text)
+        tpdu = deliver.to_bytes()
+        pdu_hex = build_pdu_for_ril(tpdu)
+
+        logger.info("Radio HAL: delivering MT-SMS from=%s text='%s'",
+                     from_number, text[:30])
+
+        # Send NEW_SMS unsolicited indication (RIL_UNSOL_RESPONSE_NEW_SMS = 1003)
+        await self._send_indication(1003, {"pdu": pdu_hex})
 
     async def supply_icc_pin(self, pin: str) -> dict:
         """IRadio::supplyIccPinForApp() - Verify PIN."""

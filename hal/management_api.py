@@ -428,6 +428,67 @@ async def get_vowifi_status():
         }
 
 
+@app.get("/status/sms")
+async def get_sms_status():
+    """Get SMS over IMS service status."""
+    try:
+        from ims.sms import get_sms_state
+        return get_sms_state()
+    except ImportError:
+        return {
+            "enabled": False,
+            "messages_sent": 0,
+            "messages_received": 0,
+            "last_error": None,
+        }
+
+
+class SendSMSRequest(BaseModel):
+    """Request body for sending an SMS via the management API."""
+    to: str
+    text: str
+
+
+@app.post("/sms/send")
+async def send_sms_api(req: SendSMSRequest):
+    """
+    Send an SMS message via the IMS stack.
+
+    This bypasses the Android RIL path and sends directly through
+    the SMS-over-IMS SIP MESSAGE flow (useful for testing).
+    """
+    try:
+        from ims.sms import SMSoverIMS, SMSConfig
+        from ims.sms_pdu import SMSSubmit, SMSAddress, DataCodingScheme
+
+        # Build a TPDU and wrap in RIL format
+        submit = SMSSubmit.create(
+            dest_number=req.to,
+            text=req.text,
+            msg_ref=0,
+        )
+        tpdu = submit.to_bytes()
+        pdu_hex = (bytes([0]) + tpdu).hex()
+
+        # Try to get the running SMS service
+        from ims.sms import _sms_state
+        if not _sms_state.get("enabled"):
+            raise HTTPException(status_code=503, detail="SMS service not running")
+
+        # For direct API sending, we use a module-level reference
+        from ims import _sms_service_ref
+        if _sms_service_ref.instance:
+            result = await _sms_service_ref.instance.send_sms("", pdu_hex)
+            if result.get("errorCode", 1) == 0:
+                return {"success": True, "messageRef": result.get("messageRef", 0)}
+            raise HTTPException(status_code=502, detail="SMS delivery failed")
+
+        raise HTTPException(status_code=503, detail="SMS service instance not available")
+
+    except ImportError:
+        raise HTTPException(status_code=503, detail="SMS module not available")
+
+
 @app.get("/status/radio")
 async def get_radio_status():
     """Get virtual radio / modem status (RIL bridge state)."""
