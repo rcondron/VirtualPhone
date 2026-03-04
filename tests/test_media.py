@@ -44,6 +44,7 @@ from ims.media import (
     JitterBuffer, JitterBufferEntry, MediaSession, MediaStats,
     get_media_state, parse_remote_rtp_address, parse_payload_type,
     _media_state,
+    VirtualAudioSource, AudioSourceType,
 )
 
 
@@ -1179,4 +1180,106 @@ class TestRTCPIntegration:
         session.jitter_buffer.packets_lost = 10
         session._send_rtcp_rr()
         assert session.stats.rtcp_rr_sent == 1
+        await session.stop()
+
+
+# =============================================================================
+# Virtual Audio Source tests
+# =============================================================================
+
+class TestVirtualAudioSource:
+    """Test virtual audio source for media sessions."""
+
+    def test_silence_source_generates_sid_frames(self):
+        """Silence source generates SID comfort noise frames."""
+        source = VirtualAudioSource(AudioSourceType.SILENCE)
+        frame = source.generate_frame(is_wideband=True)
+        assert frame.data is not None
+        assert len(frame.data) > 0
+
+    def test_zero_source_generates_zero_filled(self):
+        """Zero source generates zero-filled frames."""
+        source = VirtualAudioSource(AudioSourceType.ZERO)
+        frame = source.generate_frame(is_wideband=True, mode=8)
+        assert all(b == 0 for b in frame.data)
+
+    def test_tone_source_generates_nonzero(self):
+        """Tone source generates frames with non-zero data."""
+        source = VirtualAudioSource(AudioSourceType.TONE, frequency=440)
+        frame = source.generate_frame(is_wideband=True, mode=8)
+        assert any(b != 0 for b in frame.data)
+
+    def test_tone_source_different_frequencies(self):
+        """Different tone frequencies produce different frame data."""
+        source1 = VirtualAudioSource(AudioSourceType.TONE, frequency=440)
+        source2 = VirtualAudioSource(AudioSourceType.TONE, frequency=880)
+        frame1 = source1.generate_frame(is_wideband=True)
+        frame2 = source2.generate_frame(is_wideband=True)
+        assert frame1.data != frame2.data
+
+    def test_loopback_without_data_returns_silence(self):
+        """Loopback source without buffered data returns SID frames."""
+        source = VirtualAudioSource(AudioSourceType.LOOPBACK)
+        frame = source.generate_frame(is_wideband=True)
+        assert frame.data is not None
+
+    def test_loopback_echoes_fed_data(self):
+        """Loopback source echoes back data fed via feed_loopback."""
+        source = VirtualAudioSource(AudioSourceType.LOOPBACK)
+        test_data = b"\x42" * 64
+        source.feed_loopback(test_data)
+        frame = source.generate_frame(is_wideband=True, mode=8)
+        assert frame.data == test_data
+
+    def test_feed_loopback_ignored_for_non_loopback(self):
+        """feed_loopback is no-op for non-loopback sources."""
+        source = VirtualAudioSource(AudioSourceType.SILENCE)
+        source.feed_loopback(b"\x42" * 64)
+
+    def test_frame_count_increments(self):
+        """Frame count increments with each generate_frame call."""
+        source = VirtualAudioSource(AudioSourceType.SILENCE)
+        assert source.frame_count == 0
+        source.generate_frame()
+        assert source.frame_count == 1
+        source.generate_frame()
+        source.generate_frame()
+        assert source.frame_count == 3
+
+    def test_narrowband_frames(self):
+        """Audio source generates NB frames when is_wideband=False."""
+        source = VirtualAudioSource(AudioSourceType.ZERO)
+        frame = source.generate_frame(is_wideband=False, mode=7)
+        assert frame.is_wideband is False
+
+    @pytest.mark.asyncio
+    async def test_session_uses_audio_source(self):
+        """MediaSession uses the configured audio source."""
+        session = MediaSession()
+        await session.start(62100, "127.0.0.1", 62102)
+        source = VirtualAudioSource(AudioSourceType.TONE, frequency=1000)
+        session.set_audio_source(source)
+        session.send_amr_frame(mode=8)
+        assert source.frame_count == 1
+        await session.stop()
+
+    @pytest.mark.asyncio
+    async def test_session_default_audio_source_is_silence(self):
+        """MediaSession defaults to silence audio source."""
+        session = MediaSession()
+        await session.start(62200, "127.0.0.1", 62202)
+        assert session._audio_source.source_type == AudioSourceType.SILENCE
+        await session.stop()
+
+    @pytest.mark.asyncio
+    async def test_stats_include_audio_source(self):
+        """get_stats() includes audio_source field."""
+        session = MediaSession()
+        await session.start(62300, "127.0.0.1", 62302)
+        stats = session.get_stats()
+        assert "audio_source" in stats
+        assert stats["audio_source"] == "silence"
+        session.set_audio_source(VirtualAudioSource(AudioSourceType.TONE))
+        stats = session.get_stats()
+        assert stats["audio_source"] == "tone"
         await session.stop()

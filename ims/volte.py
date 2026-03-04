@@ -716,11 +716,9 @@ class VoLTECallManager:
         if msg.is_response:
             # Delegate response handling to SIP client
             cid = msg.call_id
-            if cid in self._sip_client._pending_responses:
+            if self._sip_client.has_pending_request(cid):
                 if msg.status_code >= 200:
-                    future = self._sip_client._pending_responses.pop(cid)
-                    if not future.done():
-                        future.set_result(msg)
+                    self._sip_client.resolve_response(msg)
                 elif msg.status_code == 180:
                     # 180 Ringing — update call state to ALERTING
                     call = self._calls.get(cid)

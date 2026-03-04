@@ -31,10 +31,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional, Callable, Awaitable
 
 from ims.rtp import (
@@ -63,6 +65,105 @@ _media_state: dict = {
 def get_media_state() -> dict:
     """Return media pipeline state for the management API."""
     return dict(_media_state)
+
+
+# ---- Virtual Audio Source ---------------------------------------------------
+
+
+class AudioSourceType(Enum):
+    """Type of virtual audio input for a media session."""
+    SILENCE = "silence"     # SID comfort noise frames
+    TONE = "tone"           # Synthetic sine wave tone (for testing)
+    ZERO = "zero"           # Zero-filled AMR frames (current default)
+    LOOPBACK = "loopback"   # Echo received audio back to sender
+
+
+class VirtualAudioSource:
+    """
+    Virtual audio source for MediaSession.
+
+    Provides configurable audio input since the virtual phone has no
+    real microphone. Each source type generates AMR frames differently:
+
+    - SILENCE: SID (Silence Insertion Descriptor) comfort noise frames
+    - TONE: Synthetic tone encoded as AMR frame data (for call testing)
+    - ZERO: Zero-filled AMR frames (default, existing behavior)
+    - LOOPBACK: Echoes received RTP payload back to sender
+
+    Usage:
+        source = VirtualAudioSource(AudioSourceType.TONE, frequency=440)
+        session.set_audio_source(source)
+    """
+
+    def __init__(self, source_type: AudioSourceType = AudioSourceType.SILENCE,
+                 frequency: int = 440):
+        self.source_type = source_type
+        self.frequency = frequency  # Hz, used for TONE mode
+        self._frame_count = 0
+        self._loopback_buffer: deque[bytes] = deque(maxlen=50)
+
+    def generate_frame(self, is_wideband: bool = True,
+                       mode: int = 8) -> AMRFrame:
+        """
+        Generate the next AMR frame based on the audio source type.
+
+        Args:
+            is_wideband: True for AMR-WB, False for AMR-NB
+            mode: AMR codec mode (0-8 for WB, 0-7 for NB)
+
+        Returns:
+            An AMRFrame ready for RTP packetization.
+        """
+        self._frame_count += 1
+
+        if self.source_type == AudioSourceType.SILENCE:
+            return AMRFrame.silence(is_wideband=is_wideband)
+
+        if self.source_type == AudioSourceType.LOOPBACK:
+            if self._loopback_buffer:
+                data = self._loopback_buffer.popleft()
+                return AMRFrame(
+                    mode=mode, quality=True,
+                    data=data, is_wideband=is_wideband,
+                )
+            # No buffered data — send silence
+            return AMRFrame.silence(is_wideband=is_wideband)
+
+        if self.source_type == AudioSourceType.TONE:
+            # Generate a synthetic tone pattern as AMR frame data.
+            # Real tone encoding would require an AMR encoder; we
+            # approximate by writing a sine pattern into the frame
+            # bytes. This won't decode to a real tone but produces
+            # non-zero, varying frame data useful for testing.
+            frame_size = AMRFrame(mode=mode, is_wideband=is_wideband).frame_size
+            sample_rate = 16000 if is_wideband else 8000
+            samples_per_frame = 320 if is_wideband else 160
+            data = bytearray(frame_size)
+            for j in range(min(frame_size, samples_per_frame)):
+                t = (self._frame_count * samples_per_frame + j) / sample_rate
+                val = int(127 * math.sin(2 * math.pi * self.frequency * t))
+                data[j] = (val + 128) & 0xFF
+            return AMRFrame(
+                mode=mode, quality=True,
+                data=bytes(data), is_wideband=is_wideband,
+            )
+
+        # ZERO (default) — zero-filled frame
+        frame_size = AMRFrame(mode=mode, is_wideband=is_wideband).frame_size
+        return AMRFrame(
+            mode=mode, quality=True,
+            data=b"\x00" * frame_size, is_wideband=is_wideband,
+        )
+
+    def feed_loopback(self, payload: bytes) -> None:
+        """Feed received RTP payload into the loopback buffer."""
+        if self.source_type == AudioSourceType.LOOPBACK:
+            self._loopback_buffer.append(payload)
+
+    @property
+    def frame_count(self) -> int:
+        """Number of frames generated so far."""
+        return self._frame_count
 
 
 # ---- Jitter Buffer ----------------------------------------------------------
@@ -268,6 +369,9 @@ class MediaSession:
         self._held = False
         self._direction: str = "sendrecv"  # sendrecv, sendonly, recvonly, inactive
 
+        # Virtual audio source
+        self._audio_source = VirtualAudioSource(AudioSourceType.SILENCE)
+
         # Callbacks
         self._on_dtmf: Optional[Callable[[str], Awaitable[None]]] = None
 
@@ -401,24 +505,31 @@ class MediaSession:
         self.stats.packets_sent += 1
         self.stats.bytes_sent += len(raw)
 
+    def set_audio_source(self, source: VirtualAudioSource) -> None:
+        """
+        Configure the virtual audio source for this session.
+
+        Args:
+            source: VirtualAudioSource with desired source type.
+        """
+        self._audio_source = source
+        logger.info("Media session audio source set to %s (ssrc=%08x)",
+                     source.source_type.value, self.ssrc)
+
     def send_amr_frame(self, mode: int = 8,
                        silence: bool = False) -> None:
         """
         Send an AMR-WB/NB frame.
 
         If silence=True, sends a SID (comfort noise) frame.
-        Otherwise sends a frame of the specified mode with synthetic data.
+        Otherwise, uses the configured virtual audio source to generate
+        the frame data. The audio source defaults to SILENCE (SID frames).
         """
         is_wb = self.codec.upper() in ("AMR-WB", "AMRWB")
         if silence:
             frame = AMRFrame.silence(is_wideband=is_wb)
         else:
-            frame = AMRFrame(
-                mode=mode,
-                quality=True,
-                data=b"\x00" * (AMRFrame(mode=mode, is_wideband=is_wb).frame_size),
-                is_wideband=is_wb,
-            )
+            frame = self._audio_source.generate_frame(is_wideband=is_wb, mode=mode)
         self.send_frame(frame.to_rtp_payload(), marker=(self._seq == 0))
 
     def send_dtmf(self, digit: str, duration_ms: int = 160) -> None:
@@ -487,6 +598,9 @@ class MediaSession:
             except ValueError:
                 pass
             return
+
+        # Feed payload to loopback audio source if configured
+        self._audio_source.feed_loopback(packet.payload)
 
         # Add to jitter buffer
         self.jitter_buffer.put(packet)
@@ -591,6 +705,7 @@ class MediaSession:
         return {
             "ssrc": f"{self.ssrc:08x}",
             "codec": self.stats.codec,
+            "audio_source": self._audio_source.source_type.value,
             "held": self._held,
             "direction": self._direction,
             "packets_sent": self.stats.packets_sent,

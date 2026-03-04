@@ -260,13 +260,8 @@ class SMSoverIMS:
                                    addr: tuple) -> None:
         """Handle an incoming SIP message (response or request)."""
         if msg.is_response:
-            # Let the SIP client handle responses to our requests
-            cid = msg.call_id
-            if cid in self._sip_client._pending_responses:
-                if msg.status_code >= 200:
-                    future = self._sip_client._pending_responses.pop(cid)
-                    if not future.done():
-                        future.set_result(msg)
+            # Let the SIP client resolve pending responses
+            self._sip_client.resolve_response(msg)
             return
 
         # Handle incoming SIP MESSAGE request (MT-SMS)

@@ -248,6 +248,60 @@ class SIPTransport:
         self._tcp_connections.clear()
 
 
+class SIPDispatcher:
+    """
+    Routes incoming SIP messages to method-specific handlers.
+
+    Solves the problem of multiple services (VoLTE, SMS) each calling
+    transport.set_handler() and overwriting each other. Instead, both
+    register with the dispatcher which routes based on SIP method.
+
+    Usage:
+        dispatcher = SIPDispatcher()
+        dispatcher.register_method("INVITE", volte_handler)
+        dispatcher.register_method("MESSAGE", sms_handler)
+        dispatcher.register_response_handler(response_handler)
+        transport.set_handler(dispatcher.dispatch)
+    """
+
+    def __init__(self):
+        self._method_handlers: dict[str, Callable[[SIPMessage, tuple], Awaitable[None]]] = {}
+        self._response_handlers: list[Callable[[SIPMessage, tuple], Awaitable[None]]] = []
+        self._default_handler: Optional[Callable[[SIPMessage, tuple], Awaitable[None]]] = None
+
+    def register_method(self, method: str,
+                        handler: Callable[[SIPMessage, tuple], Awaitable[None]]) -> None:
+        """Register a handler for a specific SIP method (INVITE, BYE, MESSAGE, etc.)."""
+        self._method_handlers[method.upper()] = handler
+
+    def register_response_handler(
+            self, handler: Callable[[SIPMessage, tuple], Awaitable[None]]) -> None:
+        """Register a handler for SIP responses. Multiple handlers are called in order."""
+        self._response_handlers.append(handler)
+
+    def set_default_handler(
+            self, handler: Callable[[SIPMessage, tuple], Awaitable[None]]) -> None:
+        """Set a fallback handler for unregistered methods."""
+        self._default_handler = handler
+
+    async def dispatch(self, msg: SIPMessage, addr: tuple) -> None:
+        """Route an incoming SIP message to the appropriate handler."""
+        if msg.is_response:
+            for handler in self._response_handlers:
+                await handler(msg, addr)
+            return
+
+        # Route by SIP method
+        method = msg.method.upper() if msg.method else ""
+        handler = self._method_handlers.get(method)
+        if handler:
+            await handler(msg, addr)
+        elif self._default_handler:
+            await self._default_handler(msg, addr)
+        else:
+            logger.debug("No handler for SIP method: %s", method)
+
+
 class SIPClient:
     """
     SIP User Agent Client for IMS.
@@ -342,6 +396,35 @@ class SIPClient:
                         future.set_result(msg)
                 else:
                     logger.debug("Provisional response %d for %s", msg.status_code, cid)
+
+    def resolve_response(self, msg: SIPMessage) -> bool:
+        """
+        Resolve a pending response for a SIP request by Call-ID.
+
+        This is the proper interface for external handlers (VoLTE, SMS) to
+        resolve pending futures instead of directly accessing _pending_responses.
+
+        Args:
+            msg: SIP response message with Call-ID and status_code.
+
+        Returns:
+            True if the response was matched and resolved, False otherwise.
+        """
+        cid = msg.call_id
+        if cid not in self._pending_responses:
+            return False
+
+        if msg.status_code is not None and msg.status_code >= 200:
+            future = self._pending_responses.pop(cid)
+            if not future.done():
+                future.set_result(msg)
+            return True
+
+        return False
+
+    def has_pending_request(self, call_id: str) -> bool:
+        """Check if there's a pending request for the given Call-ID."""
+        return call_id in self._pending_responses
 
     def build_auth_header(
         self,
