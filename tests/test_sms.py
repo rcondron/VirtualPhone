@@ -30,7 +30,9 @@ from ims.sms_pdu import (
     encode_bcd, decode_bcd,
     encode_scts_now, decode_scts,
     parse_pdu_from_ril, build_pdu_for_ril,
-    GSM7_BASIC,
+    GSM7_BASIC, GSM7_ENCODE,
+    encode_udh_concat, decode_udh_concat,
+    split_multipart, reassemble_multipart,
 )
 from ims.sms import (
     SMSoverIMS, SMSConfig, get_sms_state,
@@ -87,6 +89,70 @@ class TestGSM7BitEncoding:
         """Empty string produces empty bytes."""
         encoded = encode_gsm7("")
         assert encoded == b""
+
+    def test_roundtrip_every_length_1_to_160(self):
+        """GSM 7-bit roundtrip works for every message length 1-160."""
+        for n in range(1, 161):
+            text = "A" * n
+            enc = encode_gsm7(text)
+            dec = decode_gsm7(enc, n)
+            assert dec == text, f"Failed at length {n}"
+
+    def test_roundtrip_all_gsm7_chars(self):
+        """Every character in the GSM 7-bit alphabet survives roundtrip."""
+        for ch in GSM7_BASIC:
+            if ch == '\x1b':  # escape character
+                continue
+            enc = encode_gsm7(ch)
+            dec = decode_gsm7(enc, 1)
+            assert dec == ch, f"Failed for char {ch!r} (code={GSM7_ENCODE.get(ch)})"
+
+    def test_roundtrip_full_alphabet(self):
+        """All GSM7 chars in one string survive encode → decode."""
+        all_chars = "".join(ch for ch in GSM7_BASIC if ch != '\x1b')
+        enc = encode_gsm7(all_chars)
+        dec = decode_gsm7(enc, len(all_chars))
+        assert dec == all_chars
+
+    def test_packed_byte_count_formula(self):
+        """Packed length matches ceil(n*7/8) for various lengths."""
+        for n in range(0, 161):
+            text = "A" * n
+            enc = encode_gsm7(text)
+            expected = (n * 7 + 7) // 8 if n > 0 else 0
+            assert len(enc) == expected, f"Length {n}: got {len(enc)} bytes, expected {expected}"
+
+    def test_8th_char_boundary(self):
+        """Every 8th char is packed into the 7th byte's high bits."""
+        # 8 septets → 7 bytes, 16 → 14, 24 → 21, etc.
+        for n in [8, 16, 24, 32]:
+            text = "X" * n
+            enc = encode_gsm7(text)
+            dec = decode_gsm7(enc, n)
+            assert dec == text
+            assert len(enc) == (n * 7) // 8
+
+    def test_unmappable_chars_become_question_mark(self):
+        """Characters not in GSM7 map to '?'."""
+        enc = encode_gsm7("~")
+        dec = decode_gsm7(enc, 1)
+        assert dec == "?"
+
+    def test_encoder_decoder_agree(self):
+        """Encoder and decoder are consistent for mixed content."""
+        texts = [
+            "Hello World!",
+            "Test@123",
+            "@Hello",
+            "AAAAAAA@",
+            "0" * 160,
+            "The quick brown fox jumps over the lazy dog",
+            "Price: $100 + tax",
+        ]
+        for text in texts:
+            enc = encode_gsm7(text)
+            dec = decode_gsm7(enc, len(text))
+            assert dec == text, f"Failed for: {text!r}"
 
 
 # =============================================================================
@@ -640,6 +706,177 @@ class TestRILBridgeSMS:
         assert resp.serial == 1
         assert "errorCode" in resp.data
         assert "messageRef" in resp.data
+
+
+# =============================================================================
+# Concatenated SMS (multipart UDH) tests
+# =============================================================================
+
+class TestUDHConcat:
+    """Test UDH encoding/decoding for concatenated SMS."""
+
+    def test_encode_udh_concat(self):
+        """UDH concat encodes to 6 bytes (UDHL + IEI + IEDL + ref + total + part)."""
+        udh = encode_udh_concat(ref=42, total_parts=3, part_num=1)
+        assert len(udh) == 6
+        assert udh[0] == 0x05  # UDHL
+        assert udh[1] == 0x00  # IEI: concat 8-bit
+        assert udh[2] == 0x03  # IE data length
+        assert udh[3] == 42    # ref
+        assert udh[4] == 3     # total
+        assert udh[5] == 1     # part
+
+    def test_decode_udh_concat(self):
+        """Decode a UDH to extract concat info."""
+        udh = encode_udh_concat(ref=10, total_parts=2, part_num=2)
+        result = decode_udh_concat(udh)
+        assert result is not None
+        ref, total, part = result
+        assert ref == 10
+        assert total == 2
+        assert part == 2
+
+    def test_roundtrip_udh_concat(self):
+        """UDH concat survives encode → decode roundtrip."""
+        for ref in [0, 1, 127, 255]:
+            for total in [2, 3, 5, 10]:
+                for part in range(1, total + 1):
+                    udh = encode_udh_concat(ref, total, part)
+                    result = decode_udh_concat(udh)
+                    assert result == (ref, total, part), \
+                        f"Failed for ref={ref}, total={total}, part={part}"
+
+    def test_decode_empty_udh(self):
+        """Empty UDH returns None."""
+        assert decode_udh_concat(b"") is None
+
+    def test_decode_non_concat_udh(self):
+        """UDH without concat IE returns None."""
+        # A UDH with some other IE
+        udh = bytes([0x03, 0x70, 0x01, 0x00])  # IEI=0x70, not concat
+        assert decode_udh_concat(udh) is None
+
+
+class TestMultipartSMS:
+    """Test multipart SMS splitting and reassembly."""
+
+    def test_short_message_no_split(self):
+        """Message <= 160 chars returns a single part without UDH."""
+        parts = split_multipart("+1234", "Hello", dcs=DataCodingScheme.GSM_7BIT)
+        assert len(parts) == 1
+        assert parts[0].user_data_header is False
+
+    def test_exactly_160_chars_no_split(self):
+        """Exactly 160 chars fits in one GSM 7-bit part."""
+        text = "A" * 160
+        parts = split_multipart("+1234", text)
+        assert len(parts) == 1
+
+    def test_161_chars_splits_to_2_parts(self):
+        """161 chars splits into 2 GSM 7-bit parts."""
+        text = "A" * 161
+        parts = split_multipart("+1234", text)
+        assert len(parts) == 2
+        assert parts[0].user_data_header is True
+        assert parts[1].user_data_header is True
+
+    def test_split_306_chars_to_2_parts(self):
+        """306 chars (153*2) fits exactly in 2 parts."""
+        text = "B" * 306
+        parts = split_multipart("+1234", text)
+        assert len(parts) == 2
+        assert parts[0].text == "B" * 153
+        assert parts[1].text == "B" * 153
+
+    def test_split_307_chars_to_3_parts(self):
+        """307 chars requires 3 parts."""
+        text = "C" * 307
+        parts = split_multipart("+1234", text)
+        assert len(parts) == 3
+
+    def test_ucs2_split_threshold(self):
+        """UCS-2: > 70 chars triggers split."""
+        text = "X" * 70
+        parts = split_multipart("+1234", text, dcs=DataCodingScheme.UCS2)
+        assert len(parts) == 1
+
+        text = "X" * 71
+        parts = split_multipart("+1234", text, dcs=DataCodingScheme.UCS2)
+        assert len(parts) == 2
+
+    def test_ucs2_concat_limit_67(self):
+        """UCS-2 parts hold 67 chars each."""
+        text = "Y" * 134
+        parts = split_multipart("+1234", text, dcs=DataCodingScheme.UCS2)
+        assert len(parts) == 2
+        assert parts[0].text == "Y" * 67
+        assert parts[1].text == "Y" * 67
+
+    def test_all_parts_have_same_dest(self):
+        """All parts share the same destination number."""
+        text = "Z" * 320
+        parts = split_multipart("+14155551234", text)
+        for part in parts:
+            assert part.destination.number == "14155551234"
+
+    def test_udhi_flag_set_on_multipart(self):
+        """UDHI flag (bit 6) is set on all multipart TPDUs."""
+        text = "A" * 200
+        parts = split_multipart("+1234", text)
+        for part in parts:
+            assert part.user_data_header is True
+
+    def test_udh_present_in_user_data(self):
+        """Multipart user_data starts with UDH bytes."""
+        text = "A" * 200
+        parts = split_multipart("+1234", text)
+        for i, part in enumerate(parts, 1):
+            # UDH starts with UDHL byte (0x05 for 8-bit concat ref)
+            assert part.user_data[0] == 0x05
+            # Extract concat info from UDH
+            info = decode_udh_concat(part.user_data[:6])
+            assert info is not None
+            ref, total, part_num = info
+            assert total == len(parts)
+            assert part_num == i
+
+
+class TestReassembleMultipart:
+    """Test multipart SMS reassembly."""
+
+    def test_reassemble_two_parts(self):
+        """Two parts reassemble into original text."""
+        result = reassemble_multipart([
+            (1, 2, "Hello "),
+            (2, 2, "World!"),
+        ])
+        assert result == "Hello World!"
+
+    def test_reassemble_out_of_order(self):
+        """Parts received out of order are sorted by part number."""
+        result = reassemble_multipart([
+            (3, 3, "end"),
+            (1, 3, "start-"),
+            (2, 3, "mid-"),
+        ])
+        assert result == "start-mid-end"
+
+    def test_incomplete_returns_none(self):
+        """Missing parts return None."""
+        result = reassemble_multipart([
+            (1, 3, "hello"),
+            (3, 3, "world"),
+        ])
+        assert result is None
+
+    def test_empty_returns_none(self):
+        """Empty parts list returns None."""
+        assert reassemble_multipart([]) is None
+
+    def test_single_part(self):
+        """Single-part message reassembles correctly."""
+        result = reassemble_multipart([(1, 1, "Hello")])
+        assert result == "Hello"
 
 
 # =============================================================================

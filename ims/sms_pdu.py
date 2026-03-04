@@ -526,7 +526,13 @@ class RPAck:
 
 
 def encode_gsm7(text: str) -> bytes:
-    """Encode text using GSM 7-bit packed encoding."""
+    """
+    Encode text using GSM 7-bit packed encoding (3GPP TS 23.038).
+
+    Each character maps to a 7-bit septet. Septets are packed into octets
+    by filling bits left-to-right. Every 8th septet is fully absorbed into
+    the high bits of the previous byte, producing exactly ceil(n*7/8) bytes.
+    """
     septets = []
     for ch in text:
         code = GSM7_ENCODE.get(ch)
@@ -536,46 +542,32 @@ def encode_gsm7(text: str) -> bytes:
             # Use '?' for unmappable characters
             septets.append(GSM7_ENCODE.get("?", 0x3F))
 
-    # Pack septets into octets
+    # Pack septets into octets using bit accumulator
+    bits = 0
+    bit_count = 0
     result = bytearray()
-    shift = 0
-    for i, septet in enumerate(septets):
-        if shift == 7:
-            shift = 0
-            continue
-
-        current = (septet >> shift) & 0xFF
-        if i + 1 < len(septets):
-            current |= (septets[i + 1] << (7 - shift)) & 0xFF
-        result.append(current)
-        shift += 1
+    for septet in septets:
+        bits |= (septet & 0x7F) << bit_count
+        bit_count += 7
+        while bit_count >= 8:
+            result.append(bits & 0xFF)
+            bits >>= 8
+            bit_count -= 8
+    # Flush remaining bits (if any)
+    if bit_count > 0:
+        result.append(bits & 0xFF)
 
     return bytes(result)
 
 
 def decode_gsm7(data: bytes, num_septets: int) -> str:
-    """Decode GSM 7-bit packed data to text."""
-    septets = []
-    shift = 0
-    byte_idx = 0
+    """
+    Decode GSM 7-bit packed data to text (3GPP TS 23.038).
 
-    for _ in range(num_septets):
-        if byte_idx >= len(data):
-            break
-        septet = (data[byte_idx] >> shift) & 0x7F
-        if shift >= 1 and byte_idx + 1 < len(data):
-            septet |= (data[byte_idx + 1] << (8 - shift)) & 0x7F
-        elif shift >= 1 and byte_idx + 1 >= len(data):
-            septet = (data[byte_idx] >> shift) & 0x7F
-
-        septets.append(septet)
-        shift += 1
-        if shift == 7:
-            shift = 0
-            byte_idx += 1
-        byte_idx += 1 if shift != 0 or _ == 0 else 0
-
-    # Simpler approach: unpack all bits then extract septets
+    Reassembles the packed bit stream and extracts 7-bit septets,
+    mapping each back to the GSM 7-bit default alphabet.
+    """
+    # Unpack all bytes into a single bit accumulator
     bits = 0
     bit_count = 0
     for b in data:
@@ -649,6 +641,184 @@ def decode_scts(data: bytes) -> str:
         parts.append(val)
     year = 2000 + parts[0]
     return f"{year:04d}-{parts[1]:02d}-{parts[2]:02d}T{parts[3]:02d}:{parts[4]:02d}:{parts[5]:02d}Z"
+
+
+# ---- Concatenated SMS (multipart UDH) ----------------------------------------
+
+# User Data Header Information Element ID for concatenated SMS (8-bit ref)
+_UDH_IEI_CONCAT_8BIT = 0x00
+# 16-bit reference variant
+_UDH_IEI_CONCAT_16BIT = 0x08
+
+# GSM 7-bit: 160 chars single, 153 chars per part (7 bytes UDH = 8 septets consumed)
+# UCS-2: 70 chars single, 67 chars per part (6 bytes UDH)
+_GSM7_SINGLE_LIMIT = 160
+_GSM7_CONCAT_LIMIT = 153
+_UCS2_SINGLE_LIMIT = 70
+_UCS2_CONCAT_LIMIT = 67
+
+# Module-level counter for multipart reference numbers
+_concat_ref: int = 0
+
+
+def _next_concat_ref() -> int:
+    """Get next concatenation reference number (0-255, wrapping)."""
+    global _concat_ref
+    ref = _concat_ref
+    _concat_ref = (_concat_ref + 1) & 0xFF
+    return ref
+
+
+def encode_udh_concat(ref: int, total_parts: int, part_num: int) -> bytes:
+    """
+    Build a User Data Header for concatenated SMS (3GPP TS 23.040 9.2.3.24).
+
+    Returns the complete UDH including the UDHL byte:
+      [UDHL=0x05] [IEI=0x00] [IEDL=0x03] [ref] [total] [part]
+    """
+    return bytes([
+        0x05,                    # UDHL: 5 bytes follow
+        _UDH_IEI_CONCAT_8BIT,   # IEI: concatenated short messages, 8-bit ref
+        0x03,                    # IE data length: 3 bytes
+        ref & 0xFF,              # Concatenation reference number
+        total_parts & 0xFF,      # Total number of parts
+        part_num & 0xFF,         # Part sequence number (1-based)
+    ])
+
+
+def decode_udh_concat(udh: bytes) -> Optional[tuple[int, int, int]]:
+    """
+    Parse concatenation info from a UDH.
+
+    Returns (reference, total_parts, part_number) or None if no concat IE found.
+    """
+    if len(udh) < 1:
+        return None
+    udhl = udh[0]
+    if len(udh) < 1 + udhl:
+        return None
+
+    offset = 1
+    while offset < 1 + udhl:
+        if offset + 1 >= len(udh):
+            break
+        iei = udh[offset]
+        ie_len = udh[offset + 1]
+        if offset + 2 + ie_len > len(udh):
+            break
+
+        if iei == _UDH_IEI_CONCAT_8BIT and ie_len == 3:
+            ref = udh[offset + 2]
+            total = udh[offset + 3]
+            part = udh[offset + 4]
+            return (ref, total, part)
+        elif iei == _UDH_IEI_CONCAT_16BIT and ie_len == 4:
+            ref = (udh[offset + 2] << 8) | udh[offset + 3]
+            total = udh[offset + 4]
+            part = udh[offset + 5]
+            return (ref, total, part)
+
+        offset += 2 + ie_len
+
+    return None
+
+
+def split_multipart(dest_number: str, text: str,
+                    dcs: DataCodingScheme = DataCodingScheme.GSM_7BIT,
+                    msg_ref: int = 0) -> list[SMSSubmit]:
+    """
+    Split a long SMS into concatenated parts with UDH.
+
+    For GSM 7-bit:
+      - Single part: up to 160 septets
+      - Multi part: up to 153 septets per part (UDH consumes 7 bytes = 8 septets)
+
+    For UCS-2:
+      - Single part: up to 70 chars (140 bytes)
+      - Multi part: up to 67 chars per part (UDH consumes 6 bytes)
+
+    Returns a list of SMSSubmit objects. If the message fits in one part,
+    returns a single SMSSubmit without UDH (standard single-part SMS).
+    """
+    if dcs == DataCodingScheme.UCS2:
+        single_limit = _UCS2_SINGLE_LIMIT
+        concat_limit = _UCS2_CONCAT_LIMIT
+    else:
+        single_limit = _GSM7_SINGLE_LIMIT
+        concat_limit = _GSM7_CONCAT_LIMIT
+
+    # Single part — no UDH needed
+    if len(text) <= single_limit:
+        return [SMSSubmit.create(dest_number, text, dcs=dcs, msg_ref=msg_ref)]
+
+    # Split into parts
+    parts_text = []
+    remaining = text
+    while remaining:
+        parts_text.append(remaining[:concat_limit])
+        remaining = remaining[concat_limit:]
+
+    concat_ref = _next_concat_ref()
+    total_parts = len(parts_text)
+    result = []
+
+    for i, part_text in enumerate(parts_text, 1):
+        udh = encode_udh_concat(concat_ref, total_parts, i)
+
+        msg = SMSSubmit()
+        msg.message_ref = (msg_ref + i - 1) & 0xFF
+        msg.destination = SMSAddress.international(dest_number)
+        msg.dcs = dcs
+        msg.user_data_header = True  # Set UDHI flag in first byte
+        msg.text = part_text
+
+        # Build user_data: UDH + encoded text
+        if dcs == DataCodingScheme.UCS2:
+            encoded_text = part_text.encode("utf-16-be")
+            msg.user_data = udh + encoded_text
+        else:
+            # For GSM 7-bit with UDH: the UDH is byte-aligned, then septets
+            # start at the next septet boundary after the UDH.
+            # UDH = 6 bytes = 48 bits → next septet boundary = 49 bits = 7 septets
+            # So we need 1 fill bit, meaning septets start at bit 49
+            encoded_text = encode_gsm7(part_text)
+            # Prepend UDH; fill bits are implicit in the packing
+            msg.user_data = udh + encoded_text
+
+        result.append(msg)
+
+    return result
+
+
+def reassemble_multipart(parts: list[tuple[int, int, bytes]]) -> Optional[str]:
+    """
+    Reassemble concatenated SMS parts into a complete message.
+
+    Args:
+        parts: list of (part_number, total_parts, text_or_data) tuples.
+               Each tuple comes from parsing a received SMS-DELIVER with UDH.
+
+    Returns:
+        The reassembled text if all parts are present, None otherwise.
+    """
+    if not parts:
+        return None
+
+    # Sort by part number
+    sorted_parts = sorted(parts, key=lambda p: p[0])
+    total = sorted_parts[0][1]
+
+    # Check we have all parts
+    if len(sorted_parts) != total:
+        return None
+
+    # Verify part numbers are 1..total
+    for i, (part_num, _, _) in enumerate(sorted_parts, 1):
+        if part_num != i:
+            return None
+
+    # Concatenate
+    return "".join(str(data) for _, _, data in sorted_parts)
 
 
 # ---- PDU parsing helpers (Android RIL format) -------------------------------

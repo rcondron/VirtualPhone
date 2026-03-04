@@ -200,11 +200,10 @@ class SMSoverIMS:
     async def _send_sip_message(self, dest_number: str,
                                 tpdu: bytes) -> bool:
         """Send a SIP MESSAGE to deliver an SMS via IMS."""
-        # Wrap TPDU in RP-DATA
+        # Wrap TPDU in RP-DATA (no SMSC — IMS uses SIP routing)
         rp_data = RPData.wrap_mo(
             tpdu=tpdu,
             reference=self._next_rp_ref(),
-            smsc=self.config.smsc_address,
         )
         body = rp_data.to_bytes()
 
