@@ -27,6 +27,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <sys/stat.h>
 
 /* -------------------------------------------------------------------
  * Configuration
@@ -191,7 +192,11 @@ static void parcel_write_str16(parcel_t *p, const char *s) {
 }
 
 /* -------------------------------------------------------------------
- * Minimal JSON helpers
+ * JSON helpers — nesting-aware key lookup
+ *
+ * These helpers only match keys at the CURRENT nesting depth (depth 0
+ * relative to the start of the supplied string). This prevents
+ * mis-parsing when nested objects contain duplicate key names.
  * ------------------------------------------------------------------- */
 
 /* Build a JSON request: {"type":0,"serial":N,"id":N,"data":{...}} */
@@ -202,44 +207,88 @@ static int json_build(char *buf, size_t cap, int msg_type, int serial,
         msg_type, serial, request_id, data_json ? data_json : "{}");
 }
 
-/* Extract an integer value for a key from JSON (simple, non-recursive) */
-static int json_get_int(const char *json, const char *key, int def) {
-    char needle[128];
-    snprintf(needle, sizeof(needle), "\"%s\":", key);
-    const char *p = strstr(json, needle);
-    if (!p) return def;
-    p += strlen(needle);
-    while (*p == ' ' || *p == '\t') p++;
-    return atoi(p);
+/*
+ * Find the value position for `key` at the current nesting depth.
+ * Tracks { } [ ] depth so that keys inside nested objects are skipped.
+ * Returns a pointer to the first non-whitespace character of the value,
+ * or NULL if the key was not found at depth 0.
+ */
+static const char *json_find_key(const char *json, const char *key) {
+    if (!json || !key) return NULL;
+
+    size_t key_len = strlen(key);
+    int depth = 0;
+    const char *p = json;
+    int in_string = 0;
+
+    while (*p) {
+        /* Handle string literals — skip their contents */
+        if (*p == '"' && (p == json || *(p - 1) != '\\')) {
+            if (in_string) {
+                in_string = 0;
+                p++;
+                continue;
+            }
+            /* Start of a string — check if this is our key at depth 1
+             * (depth 1 = inside the outermost { }) */
+            if (depth == 1) {
+                /* Compare the key name */
+                if (strncmp(p + 1, key, key_len) == 0 && *(p + 1 + key_len) == '"') {
+                    /* Found key — skip past `"key":` */
+                    const char *after = p + 1 + key_len + 1; /* past closing " */
+                    while (*after == ' ' || *after == '\t' || *after == '\n' || *after == '\r') after++;
+                    if (*after == ':') {
+                        after++;
+                        while (*after == ' ' || *after == '\t' || *after == '\n' || *after == '\r') after++;
+                        return after;
+                    }
+                }
+            }
+            in_string = 1;
+            p++;
+            continue;
+        }
+        if (in_string) {
+            p++;
+            continue;
+        }
+        if (*p == '{' || *p == '[') depth++;
+        else if (*p == '}' || *p == ']') depth--;
+        p++;
+    }
+    return NULL;
 }
 
-/* Extract a string value for a key from JSON. Returns malloc'd string. */
+/* Extract an integer value for a key (nesting-aware). */
+static int json_get_int(const char *json, const char *key, int def) {
+    const char *val = json_find_key(json, key);
+    if (!val) return def;
+    return atoi(val);
+}
+
+/* Extract a string value for a key (nesting-aware). Returns malloc'd string. */
 static char *json_get_str(const char *json, const char *key) {
-    char needle[128];
-    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
-    const char *p = strstr(json, needle);
-    if (!p) return NULL;
-    p += strlen(needle);
-    const char *end = strchr(p, '"');
-    if (!end) return NULL;
-    size_t len = end - p;
+    const char *val = json_find_key(json, key);
+    if (!val || *val != '"') return NULL;
+    val++; /* skip opening " */
+    /* Find the closing quote, handling escaped quotes */
+    const char *end = val;
+    while (*end && !(*end == '"' && *(end - 1) != '\\')) end++;
+    if (*end != '"') return NULL;
+    size_t len = end - val;
     char *out = (char *)malloc(len + 1);
-    memcpy(out, p, len);
+    memcpy(out, val, len);
     out[len] = '\0';
     return out;
 }
 
-/* Check if a JSON boolean key is true */
+/* Check if a JSON boolean key is true (nesting-aware). */
 static int json_get_bool(const char *json, const char *key, int def) {
-    char needle[128];
-    snprintf(needle, sizeof(needle), "\"%s\":", key);
-    const char *p = strstr(json, needle);
-    if (!p) return def;
-    p += strlen(needle);
-    while (*p == ' ') p++;
-    if (strncmp(p, "true", 4) == 0) return 1;
-    if (strncmp(p, "false", 5) == 0) return 0;
-    return atoi(p);
+    const char *val = json_find_key(json, key);
+    if (!val) return def;
+    if (strncmp(val, "true", 4) == 0) return 1;
+    if (strncmp(val, "false", 5) == 0) return 0;
+    return atoi(val);
 }
 
 /* -------------------------------------------------------------------
@@ -299,15 +348,42 @@ static char *bridge_recv(int fd) {
     return buf;
 }
 
-/* Send request and get response from the bridge */
-static char *bridge_request(int bridge_fd, int request_id, int serial,
+/*
+ * Send request and get response from the bridge.
+ * bridge_fd_ptr is a pointer to allow reconnection on failure.
+ * On bridge disconnect, attempts to reconnect with exponential backoff
+ * (up to 4 retries: 1s, 2s, 4s, 8s) before giving up.
+ */
+static char *bridge_request(int *bridge_fd_ptr, int request_id, int serial,
                             const char *data_json) {
     char json[JSON_BUF_SIZE];
     json_build(json, sizeof(json), 0, serial, request_id,
                data_json ? data_json : "{}");
 
-    if (bridge_send(bridge_fd, json) < 0) return NULL;
-    return bridge_recv(bridge_fd);
+    for (int retry = 0; retry <= 4; retry++) {
+        if (*bridge_fd_ptr >= 0) {
+            if (bridge_send(*bridge_fd_ptr, json) == 0) {
+                char *resp = bridge_recv(*bridge_fd_ptr);
+                if (resp) return resp;
+            }
+            /* Send or recv failed — bridge connection is dead */
+            LOGW("Bridge connection lost (attempt %d/4)", retry + 1);
+            close(*bridge_fd_ptr);
+            *bridge_fd_ptr = -1;
+        }
+
+        if (retry >= 4) break;
+
+        /* Exponential backoff: 1s, 2s, 4s, 8s */
+        unsigned int delay = 1u << retry;
+        LOGI("Reconnecting to bridge in %us...", delay);
+        sleep(delay);
+
+        *bridge_fd_ptr = bridge_connect();
+    }
+
+    LOGE("Bridge reconnection failed after 4 retries");
+    return NULL;
 }
 
 /* -------------------------------------------------------------------
@@ -372,8 +448,8 @@ static void response_sim_status(parcel_t *resp, const char *data) {
     }
 }
 
-static void response_string(parcel_t *resp, const char *data, const char *key) {
-    /* Response is a single string */
+static void response_string_key(parcel_t *resp, const char *data, const char *key) {
+    /* Response is a single string, extracted by a specific key */
     char *val = json_get_str(data, key);
     parcel_write_str16(resp, val);
     free(val);
@@ -585,37 +661,73 @@ static void response_send_sms(parcel_t *resp, const char *data) {
  *     String16 number, int32 numberPresentation, String16 name,
  *     int32 namePresentation, int32 hasUusInfo(0)
  */
-static void response_current_calls(parcel_t *resp, const char *data) {
-    /* Quick count of calls by counting "index" keys */
-    int num_calls = 0;
-    const char *p = data;
-    while ((p = strstr(p, "\"index\"")) != NULL) {
-        num_calls++;
-        p += 7;
+/*
+ * Find the end of a JSON object starting at `p` (which points to '{').
+ * Tracks nested { } and string literals to find the balanced closing '}'.
+ * Returns pointer to the closing '}', or NULL if not found.
+ */
+static const char *json_skip_object(const char *p) {
+    if (!p || *p != '{') return NULL;
+    const char *start = p;
+    int depth = 0;
+    int in_str = 0;
+    while (*p) {
+        if (*p == '"' && (p == start || *(p - 1) != '\\')) {
+            in_str = !in_str;
+        } else if (!in_str) {
+            if (*p == '{') depth++;
+            else if (*p == '}') { depth--; if (depth == 0) return p; }
+        }
+        p++;
     }
-    parcel_write_i32(resp, num_calls);
+    return NULL;
+}
 
+/*
+ * Parse call objects from a JSON array. Uses bracket-balanced parsing
+ * to correctly handle nested objects (e.g. call objects containing
+ * sub-objects). Each top-level object in the array is extracted as a
+ * null-terminated substring and parsed with json_get_int/str.
+ */
+static void response_current_calls(parcel_t *resp, const char *data) {
+    /* Find the calls array */
+    const char *arr_start = strstr(data, "[");
+    if (!arr_start) {
+        parcel_write_i32(resp, 0);
+        return;
+    }
+
+    /* First pass: count call objects using balanced bracket parsing */
+    int num_calls = 0;
+    const char *scan = arr_start + 1;
+    while (*scan) {
+        while (*scan == ' ' || *scan == ',' || *scan == '\n' || *scan == '\r' || *scan == '\t') scan++;
+        if (*scan == ']' || *scan == '\0') break;
+        if (*scan == '{') {
+            const char *end = json_skip_object(scan);
+            if (!end) break;
+            num_calls++;
+            scan = end + 1;
+        } else {
+            break;
+        }
+    }
+
+    parcel_write_i32(resp, num_calls);
     if (num_calls == 0) return;
 
-    /* Parse each call from the JSON array.
-     * Simple approach: find each "{" after "calls" and extract fields. */
-    const char *calls_start = strstr(data, "[");
-    if (!calls_start) return;
-
-    p = calls_start;
+    /* Second pass: extract each call object */
+    scan = arr_start + 1;
     for (int i = 0; i < num_calls; i++) {
-        const char *obj = strchr(p + 1, '{');
-        if (!obj) break;
+        while (*scan == ' ' || *scan == ',' || *scan == '\n' || *scan == '\r' || *scan == '\t') scan++;
+        if (*scan != '{') break;
 
-        /* Find the end of this call object */
-        const char *obj_end = strchr(obj, '}');
+        const char *obj_end = json_skip_object(scan);
         if (!obj_end) break;
 
-        /* Extract fields from this call object using json_get_int/str */
-        /* We need to create a null-terminated substring */
-        size_t obj_len = obj_end - obj + 1;
+        size_t obj_len = obj_end - scan + 1;
         char *call_json = (char *)malloc(obj_len + 1);
-        memcpy(call_json, obj, obj_len);
+        memcpy(call_json, scan, obj_len);
         call_json[obj_len] = '\0';
 
         parcel_write_i32(resp, json_get_int(call_json, "state", 0));
@@ -641,7 +753,7 @@ static void response_current_calls(parcel_t *resp, const char *data) {
         parcel_write_i32(resp, 0);      /* hasUusInfo = false */
 
         free(call_json);
-        p = obj_end;
+        scan = obj_end + 1;
     }
 }
 
@@ -676,7 +788,7 @@ static void response_data_call_list(parcel_t *resp, const char *data) {
  * ------------------------------------------------------------------- */
 typedef void (*response_writer_t)(parcel_t *, const char *);
 
-static void handle_request(int client_fd, int bridge_fd,
+static void handle_request(int client_fd, int *bridge_fd_ptr,
                            const uint8_t *payload, size_t payload_len) {
     parcel_t req;
     parcel_init(&req, payload_len + 16);
@@ -697,7 +809,7 @@ static void handle_request(int client_fd, int bridge_fd,
         writer = response_sim_status;
         break;
     case RIL_REQUEST_GET_IMSI:
-        writer = (response_writer_t)response_string;
+        /* Response handled specially below (single string by key) */
         break;
     case RIL_REQUEST_OPERATOR:
         writer = response_operator;
@@ -728,7 +840,7 @@ static void handle_request(int client_fd, int bridge_fd,
         data_json = request_data_enter_pin(&req);
         break;
     case RIL_REQUEST_GET_IMEI:
-        writer = (response_writer_t)response_string;
+        /* Response handled specially below (single string by key) */
         break;
     case RIL_REQUEST_GET_CURRENT_CALLS:
         writer = response_current_calls;
@@ -753,8 +865,8 @@ static void handle_request(int client_fd, int bridge_fd,
         break;
     }
 
-    /* Forward to bridge */
-    char *resp_json = bridge_request(bridge_fd, request_id, token, data_json);
+    /* Forward to bridge (bridge_fd_ptr allows reconnection on failure) */
+    char *resp_json = bridge_request(bridge_fd_ptr, request_id, token, data_json);
     free(data_json);
 
     /* Build response Parcel */
@@ -773,7 +885,7 @@ static void handle_request(int client_fd, int bridge_fd,
             parcel_write_i32(&resp, RIL_E_SUCCESS);
             /* Write response-type-specific data */
             if (request_id == RIL_REQUEST_GET_IMSI) {
-                /* Special: response_string writes IMSI from "imsi" key */
+                /* IMSI: extract from "imsi" key */
                 char *imsi = json_get_str(data_part, "imsi");
                 parcel_write_str16(&resp, imsi);
                 free(imsi);
@@ -966,7 +1078,7 @@ static void *client_thread(void *arg) {
             got += n;
         }
 
-        handle_request(client_fd, bridge_fd, payload, payload_len);
+        handle_request(client_fd, &bridge_fd, payload, payload_len);
         free(payload);
     }
 
