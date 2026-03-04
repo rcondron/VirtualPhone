@@ -264,6 +264,10 @@ class MediaSession:
         self._rtcp_task: Optional[asyncio.Task] = None
         self._active = False
 
+        # Hold state
+        self._held = False
+        self._direction: str = "sendrecv"  # sendrecv, sendonly, recvonly, inactive
+
         # Callbacks
         self._on_dtmf: Optional[Callable[[str], Awaitable[None]]] = None
 
@@ -375,7 +379,7 @@ class MediaSession:
             frame_data: Codec frame bytes (e.g., AMR-WB octet-aligned payload)
             marker: Marker bit (True for first frame after silence)
         """
-        if not self._active:
+        if not self._active or self._held:
             return
 
         packet = RTPPacket(
@@ -540,6 +544,42 @@ class MediaSession:
 
         self.stats.rtcp_rr_sent += 1
 
+    def hold(self) -> None:
+        """
+        Put the media session on hold.
+
+        Stops sending RTP but keeps receiving (sendonly from remote).
+        The SDP direction should be changed to 'sendonly' or 'inactive'
+        via SIP re-INVITE — this method handles the media side.
+        """
+        if not self._active:
+            return
+        self._held = True
+        self._direction = "sendonly"
+        logger.info("Media session held (ssrc=%08x)", self.ssrc)
+
+    def resume(self) -> None:
+        """
+        Resume the media session from hold.
+
+        Restores bidirectional media flow (sendrecv).
+        """
+        if not self._active:
+            return
+        self._held = False
+        self._direction = "sendrecv"
+        logger.info("Media session resumed (ssrc=%08x)", self.ssrc)
+
+    @property
+    def is_held(self) -> bool:
+        """Whether the session is currently on hold."""
+        return self._held
+
+    @property
+    def direction(self) -> str:
+        """Current media direction (sendrecv, sendonly, recvonly, inactive)."""
+        return self._direction
+
     def set_dtmf_callback(self, cb: Callable[[str], Awaitable[None]]) -> None:
         """Set callback for received DTMF digits."""
         self._on_dtmf = cb
@@ -551,6 +591,8 @@ class MediaSession:
         return {
             "ssrc": f"{self.ssrc:08x}",
             "codec": self.stats.codec,
+            "held": self._held,
+            "direction": self._direction,
             "packets_sent": self.stats.packets_sent,
             "packets_received": self.stats.packets_received,
             "bytes_sent": self.stats.bytes_sent,

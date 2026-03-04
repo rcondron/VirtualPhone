@@ -51,6 +51,8 @@ class RILRequest(IntEnum):
     DIAL = 10
     GET_IMSI = 11
     HANGUP = 12
+    SWITCH_WAITING_OR_HOLDING_AND_ACTIVE = 15
+    CONFERENCE = 16
     SIGNAL_STRENGTH = 19
     VOICE_REG_STATE = 20
     DATA_REG_STATE = 21
@@ -59,9 +61,17 @@ class RILRequest(IntEnum):
     SEND_SMS = 25
     SEND_SMS_EXPECT_MORE = 26
     SIM_IO = 28
+    SEND_USSD = 29
+    CANCEL_USSD = 30
+    QUERY_CALL_FORWARD_STATUS = 33
+    SET_CALL_FORWARD = 34
     GET_IMEI = 38
     ANSWER = 40
+    SEPARATE_CONNECTION = 52
+    SET_MUTE = 53
+    GET_MUTE = 54
     DATA_CALL_LIST = 57
+    EXPLICIT_CALL_TRANSFER = 72
     SET_INITIAL_ATTACH_APN = 111
     SIM_AUTHENTICATION = 125
     SET_DATA_PROFILE = 128
@@ -75,6 +85,7 @@ class RILUnsol(IntEnum):
     NEW_SMS = 1003
     NITZ_TIME_RECEIVED = 1008
     SIM_STATUS_CHANGED = 1019
+    ON_USSD = 1028
 
 
 class RILResponse(IntEnum):
@@ -220,6 +231,16 @@ class RILBridge:
             RILRequest.DIAL: self._handle_dial,
             RILRequest.HANGUP: self._handle_hangup,
             RILRequest.ANSWER: self._handle_answer,
+            RILRequest.SWITCH_WAITING_OR_HOLDING_AND_ACTIVE: self._handle_switch_holding,
+            RILRequest.CONFERENCE: self._handle_conference,
+            RILRequest.SEPARATE_CONNECTION: self._handle_separate,
+            RILRequest.EXPLICIT_CALL_TRANSFER: self._handle_transfer,
+            RILRequest.SEND_USSD: self._handle_send_ussd,
+            RILRequest.CANCEL_USSD: self._handle_cancel_ussd,
+            RILRequest.QUERY_CALL_FORWARD_STATUS: self._handle_query_cf,
+            RILRequest.SET_CALL_FORWARD: self._handle_set_cf,
+            RILRequest.SET_MUTE: self._handle_set_mute,
+            RILRequest.GET_MUTE: self._handle_get_mute,
         }
 
         handler = handlers.get(request_id)
@@ -317,6 +338,44 @@ class RILBridge:
 
     async def _handle_answer(self, data: dict) -> dict:
         return await self.radio_hal.answer()
+
+    async def _handle_switch_holding(self, data: dict) -> dict:
+        return await self.radio_hal.switch_waiting_or_holding_and_active()
+
+    async def _handle_conference(self, data: dict) -> dict:
+        return await self.radio_hal.conference()
+
+    async def _handle_separate(self, data: dict) -> dict:
+        call_index = data.get("callIndex", data.get("gsmIndex", 1))
+        return await self.radio_hal.separate_connection(call_index)
+
+    async def _handle_transfer(self, data: dict) -> dict:
+        return await self.radio_hal.explicit_call_transfer()
+
+    async def _handle_send_ussd(self, data: dict) -> dict:
+        ussd_string = data.get("ussd", "")
+        return await self.radio_hal.send_ussd(ussd_string)
+
+    async def _handle_cancel_ussd(self, data: dict) -> dict:
+        return await self.radio_hal.cancel_ussd()
+
+    async def _handle_query_cf(self, data: dict) -> dict:
+        reason = data.get("reason", 0)
+        return await self.radio_hal.query_call_forward(reason)
+
+    async def _handle_set_cf(self, data: dict) -> dict:
+        return await self.radio_hal.set_call_forward(
+            action=data.get("action", 0),
+            reason=data.get("reason", 0),
+            number=data.get("number", ""),
+            time_seconds=data.get("timeSeconds", 20),
+        )
+
+    async def _handle_set_mute(self, data: dict) -> dict:
+        return await self.radio_hal.set_mute(data.get("mute", False))
+
+    async def _handle_get_mute(self, data: dict) -> dict:
+        return await self.radio_hal.get_mute()
 
     # -- Unsolicited indications --
 

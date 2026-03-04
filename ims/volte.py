@@ -48,7 +48,7 @@ from ims.sip_client import (
 from ims.media import MediaSession, parse_remote_rtp_address, parse_payload_type
 
 if TYPE_CHECKING:
-    from hal.radio_hal import RadioHAL
+    from hal.radio_hal import RadioHAL, CallState
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +396,262 @@ class VoLTECallManager:
         logger.info("VoLTE MT: call answered (codec=%s)", call.codec)
         return True
 
+    # ---- Hold / Resume ------------------------------------------------------
+
+    async def hold_call(self, sip_call_id: str) -> bool:
+        """
+        Put an active call on hold.
+
+        Sends SIP re-INVITE with SDP direction changed to 'sendonly',
+        and pauses the media session.
+        """
+        call = self._calls.get(sip_call_id)
+        if not call or call.state != VoLTECallState.ACTIVE:
+            logger.warning("VoLTE: cannot hold call %s (not active)", sip_call_id)
+            return False
+
+        call.state = VoLTECallState.HELD
+
+        # Pause media
+        if call.media_session:
+            call.media_session.hold()
+
+        # Send re-INVITE with sendonly SDP
+        if self._sip_client and self._started:
+            local_ip = self.config.local_ip or "10.45.0.2"
+            hold_sdp = build_sdp_offer(
+                local_ip, call.rtp_port,
+                self.config.codec_priority,
+                direction="sendonly",
+            )
+            from_uri = self.config.impu
+            if not from_uri.startswith("sip:"):
+                from_uri = f"sip:{from_uri}"
+            dest = (self.config.pcscf_address, self.config.pcscf_port)
+            headers = {"Content-Type": "application/sdp"}
+            if self.config.service_route:
+                headers["Route"] = self.config.service_route
+            try:
+                await self._sip_client.send_request(
+                    method="INVITE",
+                    request_uri=call.remote_uri,
+                    to_uri=call.remote_uri,
+                    from_uri=from_uri,
+                    dest=dest,
+                    extra_headers=headers,
+                    body=hold_sdp.encode(),
+                    call_id=sip_call_id,
+                )
+                await self._send_ack(call, dest)
+            except TimeoutError:
+                logger.warning("VoLTE: hold re-INVITE timed out")
+
+        # Update RadioHAL
+        if self._radio_hal:
+            from hal.radio_hal import CallState
+            await self._radio_hal.update_call_state(
+                call.radio_call_index, CallState.HOLDING
+            )
+
+        _volte_state["active_calls"] = len([
+            c for c in self._calls.values()
+            if c.state == VoLTECallState.ACTIVE
+        ])
+
+        logger.info("VoLTE: call %s held", sip_call_id)
+        return True
+
+    async def resume_call(self, sip_call_id: str) -> bool:
+        """
+        Resume a held call.
+
+        Sends SIP re-INVITE with SDP direction 'sendrecv',
+        and resumes the media session.
+        """
+        call = self._calls.get(sip_call_id)
+        if not call or call.state != VoLTECallState.HELD:
+            logger.warning("VoLTE: cannot resume call %s (not held)", sip_call_id)
+            return False
+
+        call.state = VoLTECallState.ACTIVE
+
+        # Resume media
+        if call.media_session:
+            call.media_session.resume()
+
+        # Send re-INVITE with sendrecv SDP
+        if self._sip_client and self._started:
+            local_ip = self.config.local_ip or "10.45.0.2"
+            resume_sdp = build_sdp_offer(
+                local_ip, call.rtp_port,
+                self.config.codec_priority,
+                direction="sendrecv",
+            )
+            from_uri = self.config.impu
+            if not from_uri.startswith("sip:"):
+                from_uri = f"sip:{from_uri}"
+            dest = (self.config.pcscf_address, self.config.pcscf_port)
+            headers = {"Content-Type": "application/sdp"}
+            if self.config.service_route:
+                headers["Route"] = self.config.service_route
+            try:
+                await self._sip_client.send_request(
+                    method="INVITE",
+                    request_uri=call.remote_uri,
+                    to_uri=call.remote_uri,
+                    from_uri=from_uri,
+                    dest=dest,
+                    extra_headers=headers,
+                    body=resume_sdp.encode(),
+                    call_id=sip_call_id,
+                )
+                await self._send_ack(call, dest)
+            except TimeoutError:
+                logger.warning("VoLTE: resume re-INVITE timed out")
+
+        # Update RadioHAL
+        if self._radio_hal:
+            from hal.radio_hal import CallState
+            await self._radio_hal.update_call_state(
+                call.radio_call_index, CallState.ACTIVE
+            )
+
+        _volte_state["active_calls"] = len([
+            c for c in self._calls.values()
+            if c.state == VoLTECallState.ACTIVE
+        ])
+
+        logger.info("VoLTE: call %s resumed", sip_call_id)
+        return True
+
+    async def swap_calls(self) -> bool:
+        """
+        Swap active and held calls (switch waiting/holding and active).
+
+        Holds the current active call and resumes the held call.
+        """
+        active = None
+        held = None
+        for c in self._calls.values():
+            if c.state == VoLTECallState.ACTIVE and active is None:
+                active = c
+            elif c.state == VoLTECallState.HELD and held is None:
+                held = c
+
+        if not active and not held:
+            return False
+
+        if active:
+            await self.hold_call(active.sip_call_id)
+        if held:
+            await self.resume_call(held.sip_call_id)
+
+        logger.info("VoLTE: calls swapped")
+        return True
+
+    # ---- Conference ---------------------------------------------------------
+
+    async def conference_calls(self) -> bool:
+        """
+        Merge the active and held calls into a conference (multi-party).
+
+        Sets is_mpty=True on both calls and resumes media for both.
+        In a real IMS network, this would send an INVITE to a
+        conference focus URI. Here we merge locally.
+        """
+        active = None
+        held = None
+        for c in self._calls.values():
+            if c.state == VoLTECallState.ACTIVE:
+                active = c
+            elif c.state == VoLTECallState.HELD:
+                held = c
+
+        if not active or not held:
+            logger.warning("VoLTE: need active + held call for conference")
+            return False
+
+        # Resume the held call
+        held.state = VoLTECallState.ACTIVE
+        if held.media_session:
+            held.media_session.resume()
+
+        # Mark both as multi-party
+        if self._radio_hal:
+            from hal.radio_hal import CallState as _CallState
+            for vc in self._radio_hal.voice_calls:
+                if vc.sip_call_id in (active.sip_call_id, held.sip_call_id):
+                    vc.is_mpty = True
+                    vc.state = _CallState.ACTIVE
+
+            await self._radio_hal._send_indication(1001, {})
+
+        _volte_state["active_calls"] = len([
+            c for c in self._calls.values()
+            if c.state == VoLTECallState.ACTIVE
+        ])
+
+        logger.info("VoLTE: conference created (%d parties)",
+                     len([c for c in self._calls.values()
+                          if c.state == VoLTECallState.ACTIVE]))
+        return True
+
+    # ---- Call Transfer ------------------------------------------------------
+
+    async def transfer_call(self, sip_call_id: str,
+                            target_number: str) -> bool:
+        """
+        Transfer a call to another party (unattended / blind transfer).
+
+        Sends SIP REFER to redirect the remote party to the target.
+        """
+        call = self._calls.get(sip_call_id)
+        if not call or call.state not in (VoLTECallState.ACTIVE,
+                                           VoLTECallState.HELD):
+            logger.warning("VoLTE: cannot transfer call %s", sip_call_id)
+            return False
+
+        if not self._sip_client or not self._started:
+            return False
+
+        from_uri = self.config.impu
+        if not from_uri.startswith("sip:"):
+            from_uri = f"sip:{from_uri}"
+        dest = (self.config.pcscf_address, self.config.pcscf_port)
+        target_uri = f"sip:{target_number.lstrip('+')}@{self.config.home_domain}"
+
+        headers = {
+            "Refer-To": f"<{target_uri}>",
+            "Referred-By": f"<{from_uri}>",
+        }
+        if self.config.service_route:
+            headers["Route"] = self.config.service_route
+
+        try:
+            logger.info("VoLTE: REFER %s → %s", sip_call_id, target_uri)
+            response = await self._sip_client.send_request(
+                method="REFER",
+                request_uri=call.remote_uri,
+                to_uri=call.remote_uri,
+                from_uri=from_uri,
+                dest=dest,
+                extra_headers=headers,
+                call_id=sip_call_id,
+            )
+
+            if response.status_code == SIPStatus.OK:
+                # Transfer accepted — terminate our leg
+                await self.hangup_call(sip_call_id)
+                logger.info("VoLTE: transfer accepted")
+                return True
+            else:
+                logger.warning("VoLTE: REFER failed: %d", response.status_code)
+                return False
+
+        except TimeoutError:
+            logger.warning("VoLTE: REFER timed out")
+            return False
+
     # ---- Hangup / BYE -------------------------------------------------------
 
     async def hangup_call(self, sip_call_id: str) -> bool:
@@ -479,11 +735,18 @@ class VoLTECallManager:
 
         # Handle incoming requests
         if msg.method == "INVITE":
-            await self._handle_incoming_invite(msg, addr)
+            # Check if this is a re-INVITE for an existing call (hold/resume)
+            call = self._calls.get(msg.call_id)
+            if call:
+                await self._handle_reinvite(msg, addr, call)
+            else:
+                await self._handle_incoming_invite(msg, addr)
         elif msg.method == "BYE":
             await self._handle_incoming_bye(msg, addr)
         elif msg.method == "CANCEL":
             await self._handle_incoming_cancel(msg, addr)
+        elif msg.method == "REFER":
+            await self._handle_incoming_refer(msg, addr)
 
     async def _handle_incoming_bye(self, msg: SIPMessage,
                                    addr: tuple) -> None:
@@ -555,6 +818,91 @@ class VoLTECallManager:
             await self._radio_hal._send_indication(1001, {})
 
         logger.info("VoLTE: remote CANCEL for call_id=%s", call_id)
+
+    async def _handle_reinvite(self, msg: SIPMessage, addr: tuple,
+                               call: VoLTECall) -> None:
+        """Handle a re-INVITE (hold/resume from remote party)."""
+        sdp = msg.body.decode("utf-8", errors="replace") if msg.body else ""
+        call.remote_sdp = sdp
+
+        # Check SDP direction to determine hold/resume
+        if "a=sendonly" in sdp or "a=inactive" in sdp:
+            # Remote is putting us on hold
+            call.state = VoLTECallState.HELD
+            if call.media_session:
+                call.media_session.hold()
+            if self._radio_hal:
+                from hal.radio_hal import CallState
+                await self._radio_hal.update_call_state(
+                    call.radio_call_index, CallState.HOLDING
+                )
+            logger.info("VoLTE: remote hold for call %s", call.sip_call_id)
+        elif "a=sendrecv" in sdp:
+            # Remote is resuming
+            call.state = VoLTECallState.ACTIVE
+            if call.media_session:
+                call.media_session.resume()
+            if self._radio_hal:
+                from hal.radio_hal import CallState
+                await self._radio_hal.update_call_state(
+                    call.radio_call_index, CallState.ACTIVE
+                )
+            logger.info("VoLTE: remote resume for call %s", call.sip_call_id)
+
+        # Send 200 OK
+        ok = SIPMessage(
+            status_code=200,
+            reason_phrase="OK",
+            headers={
+                "Via": msg.headers.get("Via", ""),
+                "From": msg.headers.get("From", ""),
+                "To": msg.headers.get("To", ""),
+                "Call-ID": msg.call_id,
+                "CSeq": msg.headers.get("CSeq", ""),
+                "Contact": f"<sip:{self.config.impu}>",
+                "Content-Type": "application/sdp",
+            },
+            body=call.local_sdp.encode(),
+        )
+        if self._sip_client:
+            await self._sip_client.transport.send(ok, addr)
+
+    async def _handle_incoming_refer(self, msg: SIPMessage,
+                                      addr: tuple) -> None:
+        """Handle incoming REFER (call transfer from remote)."""
+        call_id = msg.call_id
+        refer_to = msg.headers.get("Refer-To", "")
+        call = self._calls.get(call_id)
+
+        if not call:
+            logger.warning("VoLTE: REFER for unknown call %s", call_id)
+            return
+
+        logger.info("VoLTE: REFER for call %s → %s", call_id, refer_to)
+
+        # Accept the REFER
+        ok = SIPMessage(
+            status_code=202,
+            reason_phrase="Accepted",
+            headers={
+                "Via": msg.headers.get("Via", ""),
+                "From": msg.headers.get("From", ""),
+                "To": msg.headers.get("To", ""),
+                "Call-ID": call_id,
+                "CSeq": msg.headers.get("CSeq", ""),
+            },
+        )
+        if self._sip_client:
+            await self._sip_client.transport.send(ok, addr)
+
+        # Extract target number and initiate new call
+        target = _extract_number_from_uri(refer_to)
+        if target:
+            # Terminate old call
+            await self.hangup_call(call_id)
+            # Initiate new call to target
+            if self._radio_hal:
+                await self._radio_hal.dial(target)
 
     # ---- Helpers ------------------------------------------------------------
 
@@ -695,7 +1043,8 @@ class VoLTESession:
 
 
 def build_sdp_offer(local_ip: str, local_port: int,
-                    codec_priority: list[str] = None) -> str:
+                    codec_priority: list[str] = None,
+                    direction: str = "sendrecv") -> str:
     """
     Build an SDP offer for a VoLTE voice call.
 
@@ -704,6 +1053,10 @@ def build_sdp_offer(local_ip: str, local_port: int,
     - AMR-NB (8kHz)
     - EVS (Enhanced Voice Services)
     - telephone-event (DTMF)
+
+    Args:
+        direction: Media direction attribute. Use "sendonly" for hold,
+                   "sendrecv" for active calls, "inactive" to pause both.
     """
     if codec_priority is None:
         codec_priority = ["AMR-WB", "AMR-NB", "EVS"]
@@ -742,7 +1095,7 @@ def build_sdp_offer(local_ip: str, local_port: int,
         f"{rtpmaps}\r\n"
         f"a=ptime:20\r\n"
         f"a=maxptime:240\r\n"
-        f"a=sendrecv\r\n"
+        f"a={direction}\r\n"
     )
 
 

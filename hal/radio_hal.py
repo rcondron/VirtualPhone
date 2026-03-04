@@ -31,6 +31,7 @@ from typing import Optional, Callable, Awaitable, TYPE_CHECKING
 if TYPE_CHECKING:
     from ims.sms import SMSoverIMS
     from ims.volte import VoLTECallManager
+    from ims.supplementary import CallForwardingManager, USSDHandler
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +162,9 @@ class RadioHAL:
         self._call_manager: Optional[VoLTECallManager] = None
         self.voice_calls: list[VoiceCall] = []
         self._next_call_index: int = 1
+        self._cf_manager: Optional[CallForwardingManager] = None
+        self._ussd_handler: Optional[USSDHandler] = None
+        self._muted: bool = False
 
     def set_indication_callback(self, cb: Callable[[int, dict], Awaitable[None]]) -> None:
         """Set callback for unsolicited indications."""
@@ -173,6 +177,14 @@ class RadioHAL:
     def set_call_manager(self, mgr: VoLTECallManager) -> None:
         """Set the VoLTE call manager for voice call routing."""
         self._call_manager = mgr
+
+    def set_call_forwarding(self, cf: CallForwardingManager) -> None:
+        """Set the call forwarding manager."""
+        self._cf_manager = cf
+
+    def set_ussd_handler(self, ussd: USSDHandler) -> None:
+        """Set the USSD handler."""
+        self._ussd_handler = ussd
 
     async def power_on(self) -> None:
         """Power on the virtual radio."""
@@ -487,6 +499,185 @@ class RadioHAL:
 
         return {"success": False, "error": "Call not found"}
 
+    async def switch_waiting_or_holding_and_active(self) -> dict:
+        """
+        IRadio::switchWaitingOrHoldingAndActive()
+
+        Swap between active and held/waiting calls:
+        - If a call is WAITING: answer it and hold the active call
+        - If a call is HELD: resume it and hold the active call
+        """
+        waiting = None
+        for vc in self.voice_calls:
+            if vc.state == CallState.WAITING:
+                waiting = vc
+                break
+
+        if waiting:
+            # Answer waiting call: hold active, accept waiting
+            for vc in self.voice_calls:
+                if vc.state == CallState.ACTIVE:
+                    vc.state = CallState.HOLDING
+                    if self._call_manager:
+                        await self._call_manager.hold_call(vc.sip_call_id)
+            waiting.state = CallState.ACTIVE
+            if self._call_manager and waiting.sip_call_id:
+                await self._call_manager.answer_call(waiting.sip_call_id)
+        elif self._call_manager:
+            # Swap held and active
+            await self._call_manager.swap_calls()
+
+        await self._send_indication(1001, {})
+        return {"success": True}
+
+    async def conference(self) -> dict:
+        """
+        IRadio::conference() — Merge active and held calls.
+
+        Creates a multi-party conference call.
+        """
+        if self._call_manager:
+            result = await self._call_manager.conference_calls()
+            return {"success": result}
+        return {"success": False, "error": "No call manager"}
+
+    async def separate_connection(self, call_index: int) -> dict:
+        """
+        IRadio::separateConnection() — Remove a party from conference.
+
+        Splits a participant out of a multi-party call. The separated
+        call becomes held while the conference continues.
+        """
+        for vc in self.voice_calls:
+            if vc.index == call_index and vc.is_mpty:
+                vc.is_mpty = False
+                vc.state = CallState.HOLDING
+                if self._call_manager:
+                    await self._call_manager.hold_call(vc.sip_call_id)
+                await self._send_indication(1001, {})
+                return {"success": True}
+        return {"success": False, "error": "Call not in conference"}
+
+    async def explicit_call_transfer(self) -> dict:
+        """
+        IRadio::explicitCallTransfer() — Transfer call.
+
+        Connects the held and active calls together and disconnects
+        this phone from both (Explicit Call Transfer / ECT).
+        """
+        active = None
+        held = None
+        for vc in self.voice_calls:
+            if vc.state == CallState.ACTIVE:
+                active = vc
+            elif vc.state == CallState.HOLDING:
+                held = vc
+
+        if not active or not held:
+            return {"success": False, "error": "Need active + held call"}
+
+        if self._call_manager:
+            # Transfer the held call to the remote party of the active call
+            result = await self._call_manager.transfer_call(
+                held.sip_call_id, active.number
+            )
+            if result:
+                self.voice_calls.remove(active)
+                self.voice_calls.remove(held)
+                await self._send_indication(1001, {})
+                return {"success": True}
+
+        return {"success": False, "error": "Transfer failed"}
+
+    async def send_ussd(self, ussd_string: str) -> dict:
+        """
+        IRadio::sendUssd() — Send a USSD code.
+
+        Processes the USSD code locally or forwards to network.
+        Returns a dict with USSD response type and message.
+        """
+        logger.info("Radio HAL: sendUssd(%s)", ussd_string)
+
+        if self._ussd_handler:
+            result = self._ussd_handler.send_ussd(ussd_string)
+            # Send RIL_UNSOL_ON_USSD indication
+            await self._send_indication(1028, {
+                "type": result.get("type", 0),
+                "message": result.get("message", ""),
+            })
+            return {"success": True}
+
+        return {"success": False, "error": "USSD not available"}
+
+    async def cancel_ussd(self) -> dict:
+        """IRadio::cancelPendingUssd() — Cancel active USSD session."""
+        if self._ussd_handler:
+            self._ussd_handler.cancel_ussd()
+            return {"success": True}
+        return {"success": False}
+
+    async def set_call_forward(self, action: int, reason: int,
+                                number: str, time_seconds: int) -> dict:
+        """
+        IRadio::setCallForward() — Configure call forwarding.
+
+        Args:
+            action: 0=disable, 1=enable, 3=register, 4=erase
+            reason: 0=CFU, 1=CFB, 2=CFNR, 3=CFNRc, 4=all, 5=all_conditional
+            number: Forwarding destination number
+            time_seconds: No-reply timeout (CFNR only)
+        """
+        if not self._cf_manager:
+            return {"success": False, "error": "CF not available"}
+
+        from ims.supplementary import CallForwardReason
+
+        try:
+            cf_reason = CallForwardReason(reason)
+        except ValueError:
+            return {"success": False, "error": f"Invalid reason: {reason}"}
+
+        if action == 0:
+            self._cf_manager.disable_rule(cf_reason)
+        elif action == 1:
+            self._cf_manager.enable_rule(cf_reason)
+        elif action == 3:
+            self._cf_manager.set_rule(cf_reason, number, time_seconds)
+        elif action == 4:
+            self._cf_manager.erase_rule(cf_reason)
+        else:
+            return {"success": False, "error": f"Invalid action: {action}"}
+
+        logger.info("Radio HAL: CF action=%d reason=%s number=%s",
+                     action, cf_reason.name, number)
+        return {"success": True}
+
+    async def query_call_forward(self, reason: int) -> dict:
+        """
+        IRadio::getCallForwardStatus() — Query call forwarding rules.
+        """
+        if not self._cf_manager:
+            return {"rules": []}
+
+        from ims.supplementary import CallForwardReason
+        try:
+            cf_reason = CallForwardReason(reason)
+        except ValueError:
+            return {"rules": []}
+
+        rules = self._cf_manager.query_rule(cf_reason)
+        return {"rules": rules}
+
+    async def set_mute(self, mute: bool) -> dict:
+        """IRadio::setMute() — Mute or unmute the microphone."""
+        self._muted = mute
+        logger.info("Radio HAL: mute=%s", mute)
+        return {"success": True}
+
+    async def get_mute(self) -> dict:
+        """IRadio::getMute() — Get current mute state."""
+        return {"muted": self._muted}
+
     async def hangup_all(self) -> dict:
         """Hangup all active calls."""
         for call in list(self.voice_calls):
@@ -513,10 +704,29 @@ class RadioHAL:
         Notify Android of an incoming (MT) call.
 
         Called by VoLTE call manager when a SIP INVITE is received.
+        Checks call forwarding rules before presenting the call.
         """
+        # Check call forwarding (unconditional)
+        if self._cf_manager:
+            from ims.supplementary import CallForwardReason
+            fwd_number = self._cf_manager.should_forward(
+                CallForwardReason.UNCONDITIONAL
+            )
+            if fwd_number:
+                logger.info("Radio HAL: forwarding call from %s → %s (CFU)",
+                            number, fwd_number)
+                if self._call_manager:
+                    await self._call_manager.hangup_call(sip_call_id)
+                    await self._call_manager.initiate_call(fwd_number, 0)
+                return
+
+        # Determine call state (INCOMING if idle, WAITING if active call exists)
+        has_active = any(vc.state == CallState.ACTIVE for vc in self.voice_calls)
+        call_state = CallState.WAITING if has_active else CallState.INCOMING
+
         call = VoiceCall(
             index=self._next_call_index,
-            state=CallState.INCOMING,
+            state=call_state,
             is_mt=True,
             number=number,
             sip_call_id=sip_call_id,
@@ -524,7 +734,8 @@ class RadioHAL:
         self._next_call_index += 1
         self.voice_calls.append(call)
 
-        logger.info("Radio HAL: incoming call %d from %s", call.index, number)
+        logger.info("Radio HAL: incoming call %d from %s (state=%s)",
+                     call.index, number, call_state.name)
         # RIL_UNSOL_CALL_RING = 1002
         await self._send_indication(1002, {"isGsm": False})
         await self._send_indication(1001, {})

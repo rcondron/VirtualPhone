@@ -280,6 +280,9 @@ class TestRadioHALCallManagement:
         hal.data_calls = []
         hal.imei = "123456789012345"
         hal._registration_task = None
+        hal._cf_manager = None
+        hal._ussd_handler = None
+        hal._muted = False
         return hal
 
     @pytest.mark.asyncio
@@ -960,6 +963,9 @@ class TestRILBridgeVoiceHandlers:
         bridge.radio_hal.data_calls = []
         bridge.radio_hal.imei = "123456789012345"
         bridge.radio_hal._registration_task = None
+        bridge.radio_hal._cf_manager = None
+        bridge.radio_hal._ussd_handler = None
+        bridge.radio_hal._muted = False
         return bridge
 
     @pytest.mark.asyncio
@@ -1164,6 +1170,9 @@ class TestE2ECallFlow:
         hal.data_calls = []
         hal.imei = "123456789012345"
         hal._registration_task = None
+        hal._cf_manager = None
+        hal._ussd_handler = None
+        hal._muted = False
 
         config = VoLTEConfig(
             pcscf_address="172.28.0.43",

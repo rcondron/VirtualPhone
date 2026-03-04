@@ -515,6 +515,118 @@ async def hangup_call(call_id: str = ""):
         raise HTTPException(status_code=503, detail="VoLTE module not available")
 
 
+class CallHoldRequest(BaseModel):
+    """Request body for hold/resume."""
+    call_id: str
+
+
+@app.post("/calls/hold")
+async def hold_call(req: CallHoldRequest):
+    """Put an active VoLTE call on hold."""
+    try:
+        from ims import _volte_manager_ref
+        mgr = _volte_manager_ref.instance
+        if not mgr:
+            raise HTTPException(status_code=503, detail="VoLTE not running")
+        result = await mgr.hold_call(req.call_id)
+        return {"success": result}
+    except ImportError:
+        raise HTTPException(status_code=503, detail="VoLTE not available")
+
+
+@app.post("/calls/resume")
+async def resume_call(req: CallHoldRequest):
+    """Resume a held VoLTE call."""
+    try:
+        from ims import _volte_manager_ref
+        mgr = _volte_manager_ref.instance
+        if not mgr:
+            raise HTTPException(status_code=503, detail="VoLTE not running")
+        result = await mgr.resume_call(req.call_id)
+        return {"success": result}
+    except ImportError:
+        raise HTTPException(status_code=503, detail="VoLTE not available")
+
+
+@app.post("/calls/swap")
+async def swap_calls():
+    """Swap active and held calls."""
+    try:
+        from ims import _volte_manager_ref
+        mgr = _volte_manager_ref.instance
+        if not mgr:
+            raise HTTPException(status_code=503, detail="VoLTE not running")
+        result = await mgr.swap_calls()
+        return {"success": result}
+    except ImportError:
+        raise HTTPException(status_code=503, detail="VoLTE not available")
+
+
+@app.post("/calls/conference")
+async def conference_calls():
+    """Merge active and held calls into a conference."""
+    try:
+        from ims import _volte_manager_ref
+        mgr = _volte_manager_ref.instance
+        if not mgr:
+            raise HTTPException(status_code=503, detail="VoLTE not running")
+        result = await mgr.conference_calls()
+        return {"success": result}
+    except ImportError:
+        raise HTTPException(status_code=503, detail="VoLTE not available")
+
+
+class CallTransferRequest(BaseModel):
+    """Request body for call transfer."""
+    call_id: str
+    target_number: str
+
+
+@app.post("/calls/transfer")
+async def transfer_call(req: CallTransferRequest):
+    """Transfer a call to another party via SIP REFER."""
+    try:
+        from ims import _volte_manager_ref
+        mgr = _volte_manager_ref.instance
+        if not mgr:
+            raise HTTPException(status_code=503, detail="VoLTE not running")
+        result = await mgr.transfer_call(req.call_id, req.target_number)
+        return {"success": result}
+    except ImportError:
+        raise HTTPException(status_code=503, detail="VoLTE not available")
+
+
+class USSDRequest(BaseModel):
+    """Request body for USSD."""
+    code: str
+
+
+@app.post("/ussd/send")
+async def send_ussd(req: USSDRequest):
+    """Send a USSD code and get the response."""
+    try:
+        from ims.supplementary import USSDHandler, CallForwardingManager
+        handler = USSDHandler(CallForwardingManager())
+        return handler.send_ussd(req.code)
+    except ImportError:
+        raise HTTPException(status_code=503, detail="USSD not available")
+
+
+@app.get("/status/supplementary")
+async def get_supplementary_status():
+    """Get supplementary services status (forwarding, USSD, etc.)."""
+    try:
+        from ims.supplementary import get_supplementary_state
+        return get_supplementary_state()
+    except ImportError:
+        return {
+            "call_forwarding_rules": [],
+            "ussd_session_active": False,
+            "held_calls": 0,
+            "conference_calls": 0,
+        }
+
+
 class SendSMSRequest(BaseModel):
     """Request body for sending an SMS via the management API."""
     to: str
