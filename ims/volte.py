@@ -639,10 +639,14 @@ class VoLTECallManager:
                 call_id=sip_call_id,
             )
 
-            if response.status_code == SIPStatus.OK:
-                # Transfer accepted — terminate our leg
-                await self.hangup_call(sip_call_id)
-                logger.info("VoLTE: transfer accepted")
+            if response.status_code in (200, 202):
+                # 202 Accepted is the standard REFER response (RFC 3515)
+                logger.info("VoLTE: REFER accepted (%d)", response.status_code)
+                # Don't hang up yet — wait for NOTIFY with final status
+                # Store transfer state so NOTIFY handler can complete it
+                call.state = VoLTECallState.ACTIVE  # keep active during transfer
+                call._transfer_pending = True
+                call._transfer_target = target_uri
                 return True
             else:
                 logger.warning("VoLTE: REFER failed: %d", response.status_code)
@@ -745,6 +749,8 @@ class VoLTECallManager:
             await self._handle_incoming_cancel(msg, addr)
         elif msg.method == "REFER":
             await self._handle_incoming_refer(msg, addr)
+        elif msg.method == "NOTIFY":
+            await self._handle_incoming_notify(msg, addr)
 
     async def _handle_incoming_bye(self, msg: SIPMessage,
                                    addr: tuple) -> None:
@@ -896,11 +902,202 @@ class VoLTECallManager:
         # Extract target number and initiate new call
         target = _extract_number_from_uri(refer_to)
         if target:
+            # Send NOTIFY 100 Trying (transfer in progress)
+            await self._send_refer_notify(
+                call, addr, "SIP/2.0 100 Trying\r\n", "active")
+
             # Terminate old call
             await self.hangup_call(call_id)
+
             # Initiate new call to target
             if self._radio_hal:
                 await self._radio_hal.dial(target)
+
+            # Send NOTIFY 200 OK (transfer complete)
+            await self._send_refer_notify(
+                call, addr, "SIP/2.0 200 OK\r\n", "terminated;reason=noresource")
+
+    async def _handle_incoming_notify(self, msg: SIPMessage,
+                                      addr: tuple) -> None:
+        """
+        Handle incoming NOTIFY (REFER implicit subscription per RFC 3515).
+
+        The NOTIFY body contains message/sipfrag with the transfer status
+        (e.g., "SIP/2.0 100 Trying", "SIP/2.0 200 OK").
+        """
+        call_id = msg.call_id
+        call = self._calls.get(call_id)
+        event = msg.headers.get("Event", "")
+
+        # Send 200 OK for the NOTIFY
+        ok = SIPMessage(
+            status_code=200,
+            reason_phrase="OK",
+            headers={
+                "Via": msg.headers.get("Via", ""),
+                "From": msg.headers.get("From", ""),
+                "To": msg.headers.get("To", ""),
+                "Call-ID": call_id,
+                "CSeq": msg.headers.get("CSeq", ""),
+            },
+        )
+        if self._sip_client:
+            await self._sip_client.transport.send(ok, addr)
+
+        if not call or event != "refer":
+            return
+
+        # Parse sipfrag body for transfer status
+        sipfrag = msg.body.decode("utf-8", errors="replace") if msg.body else ""
+        sub_state = msg.headers.get("Subscription-State", "")
+
+        logger.info("VoLTE: NOTIFY for transfer %s: %s (sub=%s)",
+                     call_id, sipfrag.strip(), sub_state)
+
+        # Check if transfer succeeded (2xx in sipfrag)
+        transfer_success = False
+        if sipfrag:
+            # sipfrag looks like "SIP/2.0 200 OK" or "SIP/2.0 100 Trying"
+            parts = sipfrag.strip().split(" ", 2)
+            if len(parts) >= 2:
+                try:
+                    status = int(parts[1])
+                    if 200 <= status < 300:
+                        transfer_success = True
+                    elif status >= 400:
+                        # Transfer failed — keep the call
+                        logger.warning("VoLTE: transfer failed (%d)", status)
+                        if hasattr(call, "_transfer_pending"):
+                            del call._transfer_pending
+                        return
+                except ValueError:
+                    pass
+
+        # If subscription terminated with success, hang up our leg
+        if transfer_success or sub_state.startswith("terminated"):
+            if getattr(call, "_transfer_pending", False):
+                logger.info("VoLTE: transfer complete, hanging up %s", call_id)
+                await self.hangup_call(call_id)
+
+    async def _send_refer_notify(self, call: VoLTECall, addr: tuple,
+                                  sipfrag: str,
+                                  sub_state: str = "active") -> None:
+        """
+        Send a NOTIFY for the implicit REFER subscription (RFC 3515).
+
+        Args:
+            call: The call session being transferred.
+            addr: Destination address for the NOTIFY.
+            sipfrag: SIP status fragment (e.g., "SIP/2.0 100 Trying").
+            sub_state: Subscription-State value ("active", "terminated").
+        """
+        if not self._sip_client:
+            return
+
+        from_uri = self.config.impu
+        if not from_uri.startswith("sip:"):
+            from_uri = f"sip:{from_uri}"
+
+        body = sipfrag.encode()
+        headers = {
+            "Event": "refer",
+            "Subscription-State": sub_state,
+            "Content-Type": "message/sipfrag;version=2.0",
+        }
+        if self.config.service_route:
+            headers["Route"] = self.config.service_route
+
+        dest = (self.config.pcscf_address, self.config.pcscf_port)
+
+        try:
+            await self._sip_client.send_request(
+                method="NOTIFY",
+                request_uri=call.remote_uri,
+                to_uri=call.remote_uri,
+                from_uri=from_uri,
+                dest=dest,
+                extra_headers=headers,
+                body=body,
+                call_id=call.sip_call_id,
+            )
+        except TimeoutError:
+            logger.warning("VoLTE: REFER NOTIFY timed out")
+
+    async def attended_transfer(self, call_id_a: str,
+                                 call_id_b: str) -> bool:
+        """
+        Attended (consultative) transfer.
+
+        Transfers call A's remote party to call B's remote party using
+        REFER with a Replaces header (RFC 3891).
+
+        Flow:
+          1. Call A is active, call B is active/held (consultation call)
+          2. Send REFER to call A's remote with Refer-To pointing to
+             call B's remote, including Replaces=<call_id_b>
+          3. Call A's remote connects to call B's remote
+          4. Both our legs are terminated
+        """
+        call_a = self._calls.get(call_id_a)
+        call_b = self._calls.get(call_id_b)
+
+        if not call_a or not call_b:
+            logger.warning("VoLTE: attended transfer needs two valid calls")
+            return False
+
+        if call_a.state not in (VoLTECallState.ACTIVE, VoLTECallState.HELD):
+            logger.warning("VoLTE: call A (%s) not active/held", call_id_a)
+            return False
+
+        if not self._sip_client or not self._started:
+            return False
+
+        from_uri = self.config.impu
+        if not from_uri.startswith("sip:"):
+            from_uri = f"sip:{from_uri}"
+        dest = (self.config.pcscf_address, self.config.pcscf_port)
+
+        # Build Refer-To with Replaces header (RFC 3891)
+        # The Replaces parameter tells call A's remote to replace call B
+        refer_to_uri = (
+            f"<{call_b.remote_uri}"
+            f"?Replaces={call_id_b}>"
+        )
+
+        headers = {
+            "Refer-To": refer_to_uri,
+            "Referred-By": f"<{from_uri}>",
+        }
+        if self.config.service_route:
+            headers["Route"] = self.config.service_route
+
+        try:
+            logger.info("VoLTE: attended REFER %s → %s (replaces %s)",
+                         call_id_a, call_b.remote_uri, call_id_b)
+            response = await self._sip_client.send_request(
+                method="REFER",
+                request_uri=call_a.remote_uri,
+                to_uri=call_a.remote_uri,
+                from_uri=from_uri,
+                dest=dest,
+                extra_headers=headers,
+                call_id=call_id_a,
+            )
+
+            if response.status_code in (200, 202):
+                logger.info("VoLTE: attended transfer accepted (%d)",
+                             response.status_code)
+                call_a._transfer_pending = True
+                call_a._transfer_target = call_b.remote_uri
+                return True
+            else:
+                logger.warning("VoLTE: attended REFER failed: %d",
+                               response.status_code)
+                return False
+
+        except TimeoutError:
+            logger.warning("VoLTE: attended REFER timed out")
+            return False
 
     # ---- Helpers ------------------------------------------------------------
 

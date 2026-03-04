@@ -337,3 +337,639 @@ class TestSIPClientResolveResponse:
                          headers={"Call-ID": "cid-456"})
         client.resolve_response(msg)
         assert not client.has_pending_request("cid-456")
+
+
+# =============================================================================
+# VoLTE Call Transfer (SIP REFER) tests
+# =============================================================================
+
+from unittest.mock import AsyncMock, MagicMock, patch
+from ims.volte import (
+    VoLTECallManager, VoLTEConfig, VoLTECall, VoLTECallState,
+    _extract_number_from_uri,
+)
+
+
+def _make_manager() -> VoLTECallManager:
+    """Create a VoLTECallManager with mock SIP client for testing."""
+    config = VoLTEConfig(
+        pcscf_address="10.0.0.1",
+        pcscf_port=5060,
+        impu="sip:user@ims.example.com",
+        home_domain="ims.example.com",
+    )
+    mgr = VoLTECallManager(config)
+    mgr._started = True
+    mgr._sip_client = MagicMock()
+    mgr._sip_client.transport = MagicMock()
+    mgr._sip_client.transport.send = AsyncMock()
+    mgr._sip_client.send_request = AsyncMock()
+    mgr._sip_client.has_pending_request = MagicMock(return_value=False)
+    mgr._sip_client.resolve_response = MagicMock(return_value=False)
+    return mgr
+
+
+def _make_call(call_id: str = "test-call-1",
+               state: VoLTECallState = VoLTECallState.ACTIVE,
+               remote_uri: str = "sip:5551234@ims.example.com",
+               remote_number: str = "+5551234") -> VoLTECall:
+    """Create a VoLTECall for testing."""
+    return VoLTECall(
+        sip_call_id=call_id,
+        radio_call_index=1,
+        state=state,
+        direction="MO",
+        remote_number=remote_number,
+        remote_uri=remote_uri,
+        rtp_port=50000,
+    )
+
+
+class TestBlindTransfer:
+    """Test blind (unattended) call transfer via SIP REFER."""
+
+    @pytest.mark.asyncio
+    async def test_transfer_sends_refer_with_correct_headers(self):
+        """transfer_call sends REFER with Refer-To and Referred-By headers."""
+        mgr = _make_manager()
+        call = _make_call()
+        mgr._calls[call.sip_call_id] = call
+
+        mgr._sip_client.send_request.return_value = SIPMessage(
+            status_code=202, reason_phrase="Accepted",
+            headers={"Call-ID": call.sip_call_id})
+
+        result = await mgr.transfer_call(call.sip_call_id, "+5559999")
+        assert result is True
+
+        # Verify REFER was sent
+        send_call = mgr._sip_client.send_request.call_args
+        assert send_call.kwargs["method"] == "REFER"
+        headers = send_call.kwargs["extra_headers"]
+        assert "5559999" in headers["Refer-To"]
+        assert "Referred-By" in headers
+
+    @pytest.mark.asyncio
+    async def test_transfer_accepts_202(self):
+        """transfer_call accepts 202 Accepted (standard REFER response)."""
+        mgr = _make_manager()
+        call = _make_call()
+        mgr._calls[call.sip_call_id] = call
+
+        mgr._sip_client.send_request.return_value = SIPMessage(
+            status_code=202, reason_phrase="Accepted",
+            headers={"Call-ID": call.sip_call_id})
+
+        result = await mgr.transfer_call(call.sip_call_id, "+5559999")
+        assert result is True
+        # Call should still be in _calls (waiting for NOTIFY)
+        assert call.sip_call_id in mgr._calls
+        assert getattr(call, "_transfer_pending", False) is True
+
+    @pytest.mark.asyncio
+    async def test_transfer_accepts_200(self):
+        """transfer_call also accepts 200 OK."""
+        mgr = _make_manager()
+        call = _make_call()
+        mgr._calls[call.sip_call_id] = call
+
+        mgr._sip_client.send_request.return_value = SIPMessage(
+            status_code=200, reason_phrase="OK",
+            headers={"Call-ID": call.sip_call_id})
+
+        result = await mgr.transfer_call(call.sip_call_id, "+5559999")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_transfer_fails_on_403(self):
+        """transfer_call returns False on 403 Forbidden."""
+        mgr = _make_manager()
+        call = _make_call()
+        mgr._calls[call.sip_call_id] = call
+
+        mgr._sip_client.send_request.return_value = SIPMessage(
+            status_code=403, reason_phrase="Forbidden",
+            headers={"Call-ID": call.sip_call_id})
+
+        result = await mgr.transfer_call(call.sip_call_id, "+5559999")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_transfer_fails_on_timeout(self):
+        """transfer_call returns False on timeout."""
+        mgr = _make_manager()
+        call = _make_call()
+        mgr._calls[call.sip_call_id] = call
+
+        mgr._sip_client.send_request.side_effect = TimeoutError("timed out")
+
+        result = await mgr.transfer_call(call.sip_call_id, "+5559999")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_transfer_rejects_non_active_call(self):
+        """transfer_call rejects calls not in ACTIVE or HELD state."""
+        mgr = _make_manager()
+        call = _make_call(state=VoLTECallState.RINGING_IN)
+        mgr._calls[call.sip_call_id] = call
+
+        result = await mgr.transfer_call(call.sip_call_id, "+5559999")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_transfer_works_for_held_call(self):
+        """transfer_call works for calls in HELD state."""
+        mgr = _make_manager()
+        call = _make_call(state=VoLTECallState.HELD)
+        mgr._calls[call.sip_call_id] = call
+
+        mgr._sip_client.send_request.return_value = SIPMessage(
+            status_code=202, reason_phrase="Accepted",
+            headers={"Call-ID": call.sip_call_id})
+
+        result = await mgr.transfer_call(call.sip_call_id, "+5559999")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_transfer_unknown_call_returns_false(self):
+        """transfer_call returns False for unknown call ID."""
+        mgr = _make_manager()
+        result = await mgr.transfer_call("nonexistent", "+5559999")
+        assert result is False
+
+
+class TestIncomingRefer:
+    """Test handling of incoming SIP REFER (transfer from remote)."""
+
+    @pytest.mark.asyncio
+    async def test_incoming_refer_sends_202_accepted(self):
+        """Incoming REFER gets 202 Accepted response."""
+        mgr = _make_manager()
+        call = _make_call()
+        mgr._calls[call.sip_call_id] = call
+        mgr._radio_hal = MagicMock()
+        mgr._radio_hal.dial = AsyncMock()
+        mgr._radio_hal.voice_calls = []
+
+        msg = SIPMessage(
+            method="REFER",
+            request_uri="sip:user@ims.example.com",
+            headers={
+                "Via": "SIP/2.0/UDP 10.0.0.1",
+                "From": "<sip:5551234@ims.example.com>;tag=abc",
+                "To": "<sip:user@ims.example.com>;tag=xyz",
+                "Call-ID": call.sip_call_id,
+                "CSeq": "1 REFER",
+                "Refer-To": "<sip:5559999@ims.example.com>",
+            },
+        )
+        addr = ("10.0.0.1", 5060)
+
+        # Mock hangup to avoid full teardown
+        mgr.hangup_call = AsyncMock(return_value=True)
+        # Mock _send_refer_notify to avoid SIP client interactions
+        mgr._send_refer_notify = AsyncMock()
+
+        await mgr._handle_incoming_refer(msg, addr)
+
+        # Verify 202 Accepted was sent
+        send_calls = mgr._sip_client.transport.send.call_args_list
+        assert len(send_calls) >= 1
+        response_msg = send_calls[0][0][0]
+        assert response_msg.status_code == 202
+        assert response_msg.reason_phrase == "Accepted"
+
+    @pytest.mark.asyncio
+    async def test_incoming_refer_dials_target(self):
+        """Incoming REFER dials the Refer-To target."""
+        mgr = _make_manager()
+        call = _make_call()
+        mgr._calls[call.sip_call_id] = call
+        mgr._radio_hal = MagicMock()
+        mgr._radio_hal.dial = AsyncMock()
+        mgr._radio_hal.voice_calls = []
+
+        msg = SIPMessage(
+            method="REFER",
+            request_uri="sip:user@ims.example.com",
+            headers={
+                "Via": "SIP/2.0/UDP 10.0.0.1",
+                "From": "<sip:5551234@ims.example.com>;tag=abc",
+                "To": "<sip:user@ims.example.com>;tag=xyz",
+                "Call-ID": call.sip_call_id,
+                "CSeq": "1 REFER",
+                "Refer-To": "<sip:5559999@ims.example.com>",
+            },
+        )
+
+        mgr.hangup_call = AsyncMock(return_value=True)
+        mgr._send_refer_notify = AsyncMock()
+
+        await mgr._handle_incoming_refer(msg, ("10.0.0.1", 5060))
+
+        mgr._radio_hal.dial.assert_called_once_with("5559999")
+
+    @pytest.mark.asyncio
+    async def test_incoming_refer_hangs_up_old_call(self):
+        """Incoming REFER terminates the original call."""
+        mgr = _make_manager()
+        call = _make_call()
+        mgr._calls[call.sip_call_id] = call
+        mgr._radio_hal = MagicMock()
+        mgr._radio_hal.dial = AsyncMock()
+        mgr._radio_hal.voice_calls = []
+
+        msg = SIPMessage(
+            method="REFER",
+            request_uri="sip:user@ims.example.com",
+            headers={
+                "Via": "SIP/2.0/UDP 10.0.0.1",
+                "From": "<sip:5551234@ims.example.com>;tag=abc",
+                "To": "<sip:user@ims.example.com>;tag=xyz",
+                "Call-ID": call.sip_call_id,
+                "CSeq": "1 REFER",
+                "Refer-To": "<sip:5559999@ims.example.com>",
+            },
+        )
+
+        mgr.hangup_call = AsyncMock(return_value=True)
+        mgr._send_refer_notify = AsyncMock()
+
+        await mgr._handle_incoming_refer(msg, ("10.0.0.1", 5060))
+
+        mgr.hangup_call.assert_called_once_with(call.sip_call_id)
+
+    @pytest.mark.asyncio
+    async def test_incoming_refer_sends_notify_trying_and_ok(self):
+        """Incoming REFER sends NOTIFY 100 Trying then 200 OK."""
+        mgr = _make_manager()
+        call = _make_call()
+        mgr._calls[call.sip_call_id] = call
+        mgr._radio_hal = MagicMock()
+        mgr._radio_hal.dial = AsyncMock()
+        mgr._radio_hal.voice_calls = []
+
+        msg = SIPMessage(
+            method="REFER",
+            request_uri="sip:user@ims.example.com",
+            headers={
+                "Via": "SIP/2.0/UDP 10.0.0.1",
+                "From": "<sip:5551234@ims.example.com>;tag=abc",
+                "To": "<sip:user@ims.example.com>;tag=xyz",
+                "Call-ID": call.sip_call_id,
+                "CSeq": "1 REFER",
+                "Refer-To": "<sip:5559999@ims.example.com>",
+            },
+        )
+
+        mgr.hangup_call = AsyncMock(return_value=True)
+        notify_calls = []
+        original_send = mgr._send_refer_notify
+
+        async def track_notify(call, addr, sipfrag, sub_state):
+            notify_calls.append((sipfrag.strip(), sub_state))
+
+        mgr._send_refer_notify = track_notify
+
+        await mgr._handle_incoming_refer(msg, ("10.0.0.1", 5060))
+
+        assert len(notify_calls) == 2
+        assert "100 Trying" in notify_calls[0][0]
+        assert notify_calls[0][1] == "active"
+        assert "200 OK" in notify_calls[1][0]
+        assert "terminated" in notify_calls[1][1]
+
+    @pytest.mark.asyncio
+    async def test_incoming_refer_unknown_call_ignored(self):
+        """REFER for unknown call is silently ignored."""
+        mgr = _make_manager()
+
+        msg = SIPMessage(
+            method="REFER",
+            request_uri="sip:user@ims.example.com",
+            headers={
+                "Call-ID": "nonexistent",
+                "CSeq": "1 REFER",
+                "Refer-To": "<sip:5559999@ims.example.com>",
+            },
+        )
+
+        # Should not raise
+        await mgr._handle_incoming_refer(msg, ("10.0.0.1", 5060))
+
+
+class TestNotifyHandling:
+    """Test NOTIFY handling for REFER implicit subscription."""
+
+    @pytest.mark.asyncio
+    async def test_notify_200_terminates_transfer(self):
+        """NOTIFY with sipfrag 200 OK hangs up the transferred call."""
+        mgr = _make_manager()
+        call = _make_call()
+        call._transfer_pending = True
+        mgr._calls[call.sip_call_id] = call
+
+        mgr.hangup_call = AsyncMock(return_value=True)
+
+        msg = SIPMessage(
+            method="NOTIFY",
+            request_uri="sip:user@ims.example.com",
+            headers={
+                "Via": "SIP/2.0/UDP 10.0.0.1",
+                "From": "<sip:5551234@ims.example.com>;tag=abc",
+                "To": "<sip:user@ims.example.com>;tag=xyz",
+                "Call-ID": call.sip_call_id,
+                "CSeq": "2 NOTIFY",
+                "Event": "refer",
+                "Subscription-State": "terminated;reason=noresource",
+                "Content-Type": "message/sipfrag;version=2.0",
+            },
+            body=b"SIP/2.0 200 OK\r\n",
+        )
+
+        await mgr._handle_incoming_notify(msg, ("10.0.0.1", 5060))
+
+        mgr.hangup_call.assert_called_once_with(call.sip_call_id)
+
+    @pytest.mark.asyncio
+    async def test_notify_100_does_not_terminate(self):
+        """NOTIFY with sipfrag 100 Trying does not hang up."""
+        mgr = _make_manager()
+        call = _make_call()
+        call._transfer_pending = True
+        mgr._calls[call.sip_call_id] = call
+
+        mgr.hangup_call = AsyncMock(return_value=True)
+
+        msg = SIPMessage(
+            method="NOTIFY",
+            request_uri="sip:user@ims.example.com",
+            headers={
+                "Via": "SIP/2.0/UDP 10.0.0.1",
+                "From": "<sip:5551234@ims.example.com>;tag=abc",
+                "To": "<sip:user@ims.example.com>;tag=xyz",
+                "Call-ID": call.sip_call_id,
+                "CSeq": "2 NOTIFY",
+                "Event": "refer",
+                "Subscription-State": "active",
+                "Content-Type": "message/sipfrag;version=2.0",
+            },
+            body=b"SIP/2.0 100 Trying\r\n",
+        )
+
+        await mgr._handle_incoming_notify(msg, ("10.0.0.1", 5060))
+
+        mgr.hangup_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_notify_failure_clears_transfer(self):
+        """NOTIFY with sipfrag 4xx clears transfer_pending."""
+        mgr = _make_manager()
+        call = _make_call()
+        call._transfer_pending = True
+        mgr._calls[call.sip_call_id] = call
+
+        mgr.hangup_call = AsyncMock(return_value=True)
+
+        msg = SIPMessage(
+            method="NOTIFY",
+            request_uri="sip:user@ims.example.com",
+            headers={
+                "Via": "SIP/2.0/UDP 10.0.0.1",
+                "From": "<sip:5551234@ims.example.com>;tag=abc",
+                "To": "<sip:user@ims.example.com>;tag=xyz",
+                "Call-ID": call.sip_call_id,
+                "CSeq": "2 NOTIFY",
+                "Event": "refer",
+                "Subscription-State": "terminated;reason=rejected",
+                "Content-Type": "message/sipfrag;version=2.0",
+            },
+            body=b"SIP/2.0 486 Busy Here\r\n",
+        )
+
+        await mgr._handle_incoming_notify(msg, ("10.0.0.1", 5060))
+
+        # Should NOT hang up — transfer failed
+        mgr.hangup_call.assert_not_called()
+        assert not hasattr(call, "_transfer_pending")
+
+    @pytest.mark.asyncio
+    async def test_notify_sends_200_ok_response(self):
+        """NOTIFY always receives a 200 OK response."""
+        mgr = _make_manager()
+        call = _make_call()
+        mgr._calls[call.sip_call_id] = call
+
+        msg = SIPMessage(
+            method="NOTIFY",
+            request_uri="sip:user@ims.example.com",
+            headers={
+                "Via": "SIP/2.0/UDP 10.0.0.1",
+                "From": "<sip:remote@ims.example.com>;tag=abc",
+                "To": "<sip:user@ims.example.com>;tag=xyz",
+                "Call-ID": call.sip_call_id,
+                "CSeq": "2 NOTIFY",
+                "Event": "refer",
+                "Subscription-State": "active",
+            },
+            body=b"SIP/2.0 100 Trying\r\n",
+        )
+
+        await mgr._handle_incoming_notify(msg, ("10.0.0.1", 5060))
+
+        send_calls = mgr._sip_client.transport.send.call_args_list
+        assert len(send_calls) == 1
+        response_msg = send_calls[0][0][0]
+        assert response_msg.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_notify_non_refer_event_ignored(self):
+        """NOTIFY with Event != refer is acknowledged but not processed."""
+        mgr = _make_manager()
+        call = _make_call()
+        call._transfer_pending = True
+        mgr._calls[call.sip_call_id] = call
+
+        mgr.hangup_call = AsyncMock(return_value=True)
+
+        msg = SIPMessage(
+            method="NOTIFY",
+            request_uri="sip:user@ims.example.com",
+            headers={
+                "Via": "SIP/2.0/UDP 10.0.0.1",
+                "From": "<sip:remote@ims.example.com>;tag=abc",
+                "To": "<sip:user@ims.example.com>;tag=xyz",
+                "Call-ID": call.sip_call_id,
+                "CSeq": "2 NOTIFY",
+                "Event": "presence",
+                "Subscription-State": "terminated",
+            },
+            body=b"SIP/2.0 200 OK\r\n",
+        )
+
+        await mgr._handle_incoming_notify(msg, ("10.0.0.1", 5060))
+
+        # Should not hang up (wrong event type)
+        mgr.hangup_call.assert_not_called()
+
+
+class TestAttendedTransfer:
+    """Test attended (consultative) call transfer."""
+
+    @pytest.mark.asyncio
+    async def test_attended_transfer_sends_refer_with_replaces(self):
+        """attended_transfer sends REFER with Replaces header."""
+        mgr = _make_manager()
+        call_a = _make_call(call_id="call-a", remote_uri="sip:alice@ims.example.com")
+        call_b = _make_call(call_id="call-b", remote_uri="sip:bob@ims.example.com")
+        mgr._calls["call-a"] = call_a
+        mgr._calls["call-b"] = call_b
+
+        mgr._sip_client.send_request.return_value = SIPMessage(
+            status_code=202, reason_phrase="Accepted",
+            headers={"Call-ID": "call-a"})
+
+        result = await mgr.attended_transfer("call-a", "call-b")
+        assert result is True
+
+        send_call = mgr._sip_client.send_request.call_args
+        assert send_call.kwargs["method"] == "REFER"
+        headers = send_call.kwargs["extra_headers"]
+        assert "Replaces=call-b" in headers["Refer-To"]
+        assert "bob@ims.example.com" in headers["Refer-To"]
+
+    @pytest.mark.asyncio
+    async def test_attended_transfer_fails_missing_call(self):
+        """attended_transfer fails if either call doesn't exist."""
+        mgr = _make_manager()
+        call_a = _make_call(call_id="call-a")
+        mgr._calls["call-a"] = call_a
+
+        result = await mgr.attended_transfer("call-a", "call-missing")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_attended_transfer_fails_non_active_call(self):
+        """attended_transfer fails if call A is not active/held."""
+        mgr = _make_manager()
+        call_a = _make_call(call_id="call-a", state=VoLTECallState.RINGING_IN)
+        call_b = _make_call(call_id="call-b")
+        mgr._calls["call-a"] = call_a
+        mgr._calls["call-b"] = call_b
+
+        result = await mgr.attended_transfer("call-a", "call-b")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_attended_transfer_rejected(self):
+        """attended_transfer returns False on rejection."""
+        mgr = _make_manager()
+        call_a = _make_call(call_id="call-a")
+        call_b = _make_call(call_id="call-b")
+        mgr._calls["call-a"] = call_a
+        mgr._calls["call-b"] = call_b
+
+        mgr._sip_client.send_request.return_value = SIPMessage(
+            status_code=603, reason_phrase="Decline",
+            headers={"Call-ID": "call-a"})
+
+        result = await mgr.attended_transfer("call-a", "call-b")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_attended_transfer_sets_pending(self):
+        """attended_transfer sets _transfer_pending on call A."""
+        mgr = _make_manager()
+        call_a = _make_call(call_id="call-a")
+        call_b = _make_call(call_id="call-b")
+        mgr._calls["call-a"] = call_a
+        mgr._calls["call-b"] = call_b
+
+        mgr._sip_client.send_request.return_value = SIPMessage(
+            status_code=202, reason_phrase="Accepted",
+            headers={"Call-ID": "call-a"})
+
+        await mgr.attended_transfer("call-a", "call-b")
+        assert getattr(call_a, "_transfer_pending", False) is True
+
+
+class TestSendReferNotify:
+    """Test _send_refer_notify helper."""
+
+    @pytest.mark.asyncio
+    async def test_sends_notify_with_sipfrag(self):
+        """_send_refer_notify sends NOTIFY with correct headers and body."""
+        mgr = _make_manager()
+        call = _make_call()
+
+        await mgr._send_refer_notify(
+            call, ("10.0.0.1", 5060),
+            "SIP/2.0 200 OK\r\n", "terminated;reason=noresource")
+
+        send_call = mgr._sip_client.send_request.call_args
+        assert send_call.kwargs["method"] == "NOTIFY"
+        headers = send_call.kwargs["extra_headers"]
+        assert headers["Event"] == "refer"
+        assert "terminated" in headers["Subscription-State"]
+        assert headers["Content-Type"] == "message/sipfrag;version=2.0"
+        assert send_call.kwargs["body"] == b"SIP/2.0 200 OK\r\n"
+
+    @pytest.mark.asyncio
+    async def test_sends_notify_active_state(self):
+        """_send_refer_notify can send with active subscription state."""
+        mgr = _make_manager()
+        call = _make_call()
+
+        await mgr._send_refer_notify(
+            call, ("10.0.0.1", 5060),
+            "SIP/2.0 100 Trying\r\n", "active")
+
+        send_call = mgr._sip_client.send_request.call_args
+        headers = send_call.kwargs["extra_headers"]
+        assert headers["Subscription-State"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_no_crash_without_sip_client(self):
+        """_send_refer_notify is a no-op if SIP client is None."""
+        mgr = _make_manager()
+        mgr._sip_client = None
+        call = _make_call()
+
+        # Should not raise
+        await mgr._send_refer_notify(
+            call, ("10.0.0.1", 5060), "SIP/2.0 200 OK\r\n", "terminated")
+
+
+class TestIncomingSipRouting:
+    """Test that NOTIFY and REFER are routed properly in _handle_incoming_sip."""
+
+    @pytest.mark.asyncio
+    async def test_refer_routed_to_handler(self):
+        """REFER request is routed to _handle_incoming_refer."""
+        mgr = _make_manager()
+        mgr._handle_incoming_refer = AsyncMock()
+
+        msg = SIPMessage(
+            method="REFER",
+            request_uri="sip:user@ims.example.com",
+            headers={"Call-ID": "test-call", "CSeq": "1 REFER"},
+        )
+
+        await mgr._handle_incoming_sip(msg, ("10.0.0.1", 5060))
+        mgr._handle_incoming_refer.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_notify_routed_to_handler(self):
+        """NOTIFY request is routed to _handle_incoming_notify."""
+        mgr = _make_manager()
+        mgr._handle_incoming_notify = AsyncMock()
+
+        msg = SIPMessage(
+            method="NOTIFY",
+            request_uri="sip:user@ims.example.com",
+            headers={"Call-ID": "test-call", "CSeq": "1 NOTIFY",
+                      "Event": "refer"},
+        )
+
+        await mgr._handle_incoming_sip(msg, ("10.0.0.1", 5060))
+        mgr._handle_incoming_notify.assert_called_once()
