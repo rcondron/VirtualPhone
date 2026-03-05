@@ -155,10 +155,11 @@ class SIPMessage:
             lines.append(f"{name}: {value}")
 
         lines.append("")  # blank line before body
+        lines.append("")  # ensures double CRLF (header/body separator per RFC 3261)
 
         result = "\r\n".join(lines).encode()
         if self.body:
-            result += b"\r\n" + self.body
+            result += self.body
 
         return result
 
@@ -268,6 +269,24 @@ class SIPClient:
         self._cseq = 1
         self._pending_responses: dict[str, asyncio.Future] = {}
 
+    def _get_contact_ip(self) -> str:
+        """Get the IP to use in Via/Contact headers.
+
+        If bound to 0.0.0.0, discover the actual IP by connecting
+        to the P-CSCF (or a known peer) and reading the local address.
+        """
+        if self.local_ip != "0.0.0.0":
+            return self.local_ip
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("172.28.0.41", 5060))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return self.local_ip
+
     async def start(self) -> None:
         self.transport.set_handler(self._handle_message)
         await self.transport.start()
@@ -295,8 +314,9 @@ class SIPClient:
         branch = generate_branch()
         tag = generate_tag()
 
+        contact_ip = self._get_contact_ip()
         headers = {
-            "Via": f"SIP/2.0/{self.transport.transport} {self.local_ip}:{self.local_port};branch={branch}",
+            "Via": f"SIP/2.0/{self.transport.transport} {contact_ip}:{self.local_port};branch={branch}",
             "Max-Forwards": "70",
             "From": f"<{from_uri}>;tag={tag}",
             "To": f"<{to_uri}>",

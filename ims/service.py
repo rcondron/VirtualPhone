@@ -212,7 +212,8 @@ async def main():
             "state": reg.state.value,
         })
 
-    # Start VoLTE call manager
+    # Start VoLTE call manager — share the SIP client from registration
+    # to avoid port 5060 conflict
     service_route = reg.service_route or ""
     volte_config = VoLTEConfig(
         pcscf_address=ims_proxy,
@@ -222,16 +223,22 @@ async def main():
         impi=impi,
         home_domain=home_domain,
         service_route=service_route,
+        local_ip=reg._sip_client._get_contact_ip() if reg._sip_client else "",
+        rtp_port_base=50000,
     )
     volte_mgr = VoLTECallManager(volte_config)
-    await volte_mgr.start()
+    # Share the existing SIP client to avoid binding port 5060 again
+    volte_mgr._sip_client = reg._sip_client
+    volte_mgr._started = True
+    from ims.volte import _volte_state
+    _volte_state["enabled"] = True
     logger.info("VoLTE call manager started")
 
     # Register VoLTE manager reference for management API
     from ims import _volte_manager_ref
     _volte_manager_ref.instance = volte_mgr
 
-    # Start SMS over IMS service
+    # Start SMS over IMS service — share SIP client from registration
     sms_service = SMSoverIMS(SMSConfig(
         pcscf_address=ims_proxy,
         pcscf_port=5060,
@@ -240,7 +247,11 @@ async def main():
         impi=impi,
         home_domain=home_domain,
     ))
-    await sms_service.start()
+    # Share the existing SIP client to avoid binding port 5060 again
+    sms_service._sip_client = reg._sip_client
+    sms_service._started = True
+    from ims.sms import _sms_state
+    _sms_state["enabled"] = True
 
     # Register SMS service reference for management API
     from ims import _sms_service_ref

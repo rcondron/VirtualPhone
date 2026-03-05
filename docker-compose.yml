@@ -270,7 +270,7 @@ services:
       - ./scripts/scscf_auth_helper.py:/app/scscf_auth_helper.py:ro
       - ./euicc:/app/euicc:ro
     command: >
-      sh -c "pip install -q pymongo && python /app/scscf_auth_helper.py"
+      sh -c "pip install -q pymongo pycryptodome && python /app/scscf_auth_helper.py"
     environment:
       - MONGO_HOST=mongodb
       - MONGO_PORT=27017
